@@ -1,6 +1,7 @@
 fun prn (str: string): unit = TextIO.output (TextIO.stdOut, str ^ "\n")
 
-(* Fundamentals
+(*
+ * Fundamentals
  * ============
  * claim    links an identifier and a type
  * alias    links an identifier and a value
@@ -76,11 +77,17 @@ end = struct
   }
 end
 
-structure Reader :> sig
-  type t
+structure Reader : sig
+  datatype t =
+    ATOM of string
+  | LIST of t vector
+  | FOREST of t vector
+
   val read: Source.t -> t option
   val pp: t -> string
 end = struct
+  (* TODO: figure out how to only have one definition *)
+  (* TODO: Annotate each item with its source position, for error handling *)
   datatype t =
     ATOM of string
   | LIST of t vector
@@ -115,7 +122,7 @@ end = struct
       ATOM s => s
     | LIST l =>
       let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else " ") ^ (pp e))
-      in "(" ^ ((fn (_, x) => x) (Vector.foldl f (true, "") l)) ^ ")" 
+      in "(" ^ ((fn (_, x) => x) (Vector.foldl f (true, "") l)) ^ ")"
       end
     | FOREST l =>
       let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else "\n") ^ (pp e))
@@ -175,9 +182,15 @@ structure Parser :> sig
   val pp: t -> string
   val parse: Reader.t -> t option
 end = struct
-  datatype ops =
-    CLAIM
-  | ALIAS
+  datatype t =
+    PRIMOP of primop
+  | ATOM of string
+  | LIST of t vector
+  | FOREST of t vector
+
+  and primop =
+    CLAIM of string * t
+  | ALIAS of string * t
   | LAMBDA
   | FUNCTION
   | BIND
@@ -187,22 +200,81 @@ end = struct
   | EQUAL
   | PRIM
 
-  type t = unit
+  fun pp (p: t): string =
+    case p of
+      PRIMOP p' => (
+        case p' of
+          CLAIM (s, t) => "(claim " ^ s ^ " " ^ (pp t) ^ ")"
+        | ALIAS (s, t) => "(alias " ^ s ^ " " ^ (pp t) ^ ")"
+        | _ => "unimplemented"
+      )
+    | ATOM a => a
+    | LIST l =>
+      let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else " ") ^ (pp e))
+      in "(" ^ ((fn (_, x) => x) (Vector.foldl f (true, "") l)) ^ ")"
+      end
+    | FOREST l =>
+      let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else "\n") ^ (pp e))
+      in (fn (_, x) => x) (Vector.foldl f (true, "") l)
+      end
 
-  fun pp (p: t): string = "unimplemented"
+  fun parseClaim (ls: Reader.t vector): t option =
+    if Vector.length ls <> 3 then NONE
+    else case Vector.sub (ls, 1) of
+        Reader.ATOM a =>
+          Option.map (fn x => PRIMOP (CLAIM (a, x)))
+            (parse (Vector.sub (ls, 2)))
+      | _ => NONE
 
-  fun parse (r: Reader.t): t option = NONE
+  and parseAlias (ls: Reader.t vector): t option =
+    if Vector.length ls <> 3 then NONE
+    else case Vector.sub (ls, 1) of
+        Reader.ATOM a =>
+          Option.map (fn x => PRIMOP (ALIAS (a, x)))
+            (parse (Vector.sub (ls, 2)))
+      | _ => NONE
+
+  and parse (r: Reader.t): t option =
+    case r of
+      Reader.FOREST ss =>
+        let
+          fun f (_, NONE) = NONE
+            | f (e, SOME vs) =
+              Option.map (fn x => Vector.concat [vs, Vector.fromList [x]])
+                (parse e)
+        in Option.map (fn x => FOREST x)
+          (Vector.foldl f (SOME (Vector.fromList [])) ss)
+        end
+    | Reader.LIST ls =>
+      if Vector.length ls = 0 then SOME (LIST (Vector.fromList []))
+      else (
+        case Vector.sub (ls, 0) of
+          Reader.ATOM "claim" => parseClaim ls
+        | Reader.ATOM "alias" => parseAlias ls
+        | _ =>
+          let
+            fun f (_, NONE) = NONE
+              | f (e, SOME vs) =
+                Option.map (fn x => Vector.concat [vs, Vector.fromList [x]])
+                  (parse e)
+          in Option.map (fn x => LIST x)
+            (Vector.foldl f (SOME (Vector.fromList [])) ls)
+          end
+      )
+    | Reader.ATOM "claim" => NONE
+    | Reader.ATOM "alias" => NONE
+    | Reader.ATOM a => SOME (ATOM a)
 end
 
 fun main () =
   let
     val source = Source.fromStream TextIO.stdIn
+    (*
     val prog = Reader.read source
     val repr = case prog of SOME p => Reader.pp p | NONE => "ERROR!!"
-    (*
+    *)
     val parsed = Option.composePartial (Parser.parse, Reader.read) source
     val repr = case parsed of SOME p => Parser.pp p | NONE => "ERROR!!"
-    *)
   in TextIO.output (TextIO.stdOut, repr ^ "\n")
   end
 
