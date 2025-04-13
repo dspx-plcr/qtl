@@ -1,5 +1,11 @@
 fun prn (str: string): unit = TextIO.output (TextIO.stdOut, str ^ "\n")
 
+structure Result = struct
+  datatype ('a, 'b) result = Ok of 'a | Err of 'b
+end
+
+open Result
+
 (*
  * Fundamentals
  * ============
@@ -17,11 +23,23 @@ fun prn (str: string): unit = TextIO.output (TextIO.stdOut, str ^ "\n")
  *)
 
 structure Source = struct
+  type token = int
   type t = {
     buf: string,
     pos: int ref,
-    marks: (string * int) list ref
+    marks: (string * int * token) list ref,
+    next_tok: int ref
   }
+
+  type slice = { start: int, len: int }
+  exception exc of string
+  val succeed_no_start = "internal error: attempting to succeed at reading" ^
+    " without having started to read anything"
+  val fail_no_start = "internal error: attempting to fail at reading without" ^
+    " having started to read anything"
+  val big_line_pos = "internal error: attempting to convert pos to line and" ^
+    " column when pos is pointing past the end of the buffer"
+  val bad_token = "internal error: attempted to remove mark with invalid token"
 
   fun eof (buf: t): bool =
     (String.size (#buf buf) <= 0) orelse (String.size (#buf buf) <= !(#pos buf))
@@ -32,18 +50,82 @@ structure Source = struct
   fun advance (buf: t): t = ((#pos buf) := !(#pos buf) + 1; buf)
   fun substring (buf: t, i: int, j: int) = String.substring (#buf buf, i, j)
 
+  fun line_col ({ buf = buf, pos = pos, marks = marks, next_tok = _ }: t)
+    : int * int =
+    let
+      fun make_marks (ms, res) =
+        case ms of
+          [] => res
+        | (s,p,t)::ms' =>
+          let val res' = (res ^ "\n" ^ (Int.toString p) ^ ": " ^ s)
+          in make_marks (ms', res')
+          end
+      fun helper (l, l', p) =
+        if p = !pos then (l, p - l')
+        else if String.sub (buf, p) = #"\n" then helper (l+1, p+1, p+1)
+        else helper (l, l', p+1)
+    in
+      if String.size buf <= !pos
+      then raise exc (big_line_pos ^
+        "\nbuf size: " ^ (Int.toString (String.size buf)) ^
+        "\npos: " ^ (Int.toString (!pos)) ^
+        "\nmarks:\n" ^ (make_marks (!marks, "")))
+      else helper (1, 0, 0)
+    end
 
-  fun start (buf: t, msg: string): unit =
-    (#marks buf) := (msg, !(#pos buf)) :: !(#marks buf)
-  fun success (buf: t): unit =
-    let val marks = #marks buf
-    in marks := (case !marks of
-        [] => []
-      | (m::ms) => ms)
+  fun start (buf: t, msg: string): token =
+    let val tok = !(#next_tok buf)
+    in (
+      (#marks buf) := (msg, !(#pos buf), tok) :: !(#marks buf);
+      (#next_tok buf) := tok + 1;
+      tok
+    ) end
+  fun success (buf: t, tok: token): slice =
+    let
+      val marks = #marks buf
+      val start = case !marks of
+          [] =>
+            let val (line, col) = line_col buf
+          in raise exc (succeed_no_start ^
+            "\nline: " ^ (Int.toString line) ^
+                ", col: " ^ (Int.toString col))
+            end
+        | ((_,p,t)::ms) =>
+          if t = tok
+          then (marks := ms; p)
+          else raise exc (bad_token ^
+            "\nexpected: " ^ (Int.toString t) ^
+            "\nreceived: " ^ (Int.toString tok))
+    in
+      (* TODO: check for off by one-ish *)
+      { start = start, len = !(#pos buf) - start - 1 }
+    end
+
+  fun expected_token (buf: t, tok: token): bool =
+    case !(#marks buf) of
+      [] => false
+    | (_,_,t)::_ => tok = t
+
+  fun failure (buf: t, tok: token, msg: string): string =
+    let
+      fun build_msg (res, ms): string = msg
+    in case !(#marks buf) of
+        [] => 
+        let val (line, col) = line_col buf
+        in raise exc (fail_no_start ^
+            "\nline: " ^ (Int.toString line) ^
+            ", col: " ^ (Int.toString col))
+        end
+      | (m,p,t)::ms =>
+        if t = tok
+        then (#marks buf := ms; build_msg ("", !(#marks buf)))
+    else raise exc (bad_token ^
+      "\nexpected: " ^ (Int.toString t) ^
+      "\nreceived: " ^ (Int.toString tok))
     end
 
   fun fromString (str: string): t =
-    { buf = str, pos = ref 0, marks = ref [] }
+    { buf = str, pos = ref 0, marks = ref [], next_tok = ref 0 }
   fun fromStream (ss: TextIO.instream): t =
     let val str = TextIO.inputAll ss
     in fromString str
@@ -78,20 +160,22 @@ end = struct
 end
 
 structure Reader : sig
-  datatype t =
+  type t
+  datatype item =
     ATOM of string
   | LIST of t vector
   | FOREST of t vector
 
-  val read: Source.t -> t option
+  val read: Source.t -> (t, string) result
   val pp: t -> string
 end = struct
   (* TODO: figure out how to only have one definition *)
-  (* TODO: Annotate each item with its source position, for error handling *)
-  datatype t =
+  datatype item =
     ATOM of string
   | LIST of t vector
   | FOREST of t vector
+  withtype t = { source: Source.slice, item: item }
+
 
   (* TODO: some chars can be after the initial pos but not in *)
   fun isAtomChar (c: char): bool =
@@ -118,7 +202,7 @@ end = struct
     | _ => false
 
   fun pp (e: t): string =
-    case e of
+    case #item e of
       ATOM s => s
     | LIST l =>
       let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else " ") ^ (pp e))
@@ -133,49 +217,71 @@ end = struct
     fun readAtom (buf: Source.t): t =
       let
         val start = Source.pos buf
+        val tok = Source.start (buf, "reading an atom")
         fun helper n =
           case Source.try_peek buf of
-            NONE => ATOM (Source.substring (buf, start, n))
+            NONE => {
+              source = Source.success (buf, tok),
+              item = ATOM (Source.substring (buf, start, n))
+            }
           | SOME c =>
             if isAtomChar c
             then (Source.advance buf; helper (n + 1))
-            else ATOM (Source.substring (buf, start, n))
+            else {
+              source = Source.success (buf, tok),
+              item = ATOM (Source.substring (buf, start, n))
+            }
       in helper 0
       end
 
-    and readList (buf: Source.t): t option =
+    and readList (buf: Source.t): (t, string) result =
       let
+        val tok = Source.start (buf, "reading a list")
         fun helper res =
           case Source.try_peek buf of
-            NONE => NONE
+            NONE => Err (Source.failure (buf, tok, "couldn't find list end"))
           | SOME #")" =>
-            (Source.advance buf; SOME (LIST (Vector.fromList (List.rev res))))
+            (Source.advance buf; Ok {
+              source = Source.success (buf, tok),
+              item = LIST (Vector.fromList (List.rev res))
+            })
           | _ => case readHelper buf of
-              NONE => NONE
-            | SOME e => helper (e :: res)
+              NONE => Err (Source.failure (buf, tok, "couldn't find list end"))
+            | SOME r => case r of
+                Err e => Err (Source.failure (buf, tok, e))
+              | Ok v => helper (v :: res)
       in (Source.advance buf; helper [])
       end
 
-    and readForest (res: t list) (buf: Source.t): t option =
-      case readHelper buf of
-        NONE => if Source.eof buf
-          then SOME (FOREST (Vector.fromList (List.rev res)))
-          else NONE
-      | SOME e => readForest (e :: res) buf
+    and readForest (res: t list) (buf: Source.t): (t, string) result =
+      let
+        (* TODO: better terminology *)
+        val tok = Source.start (buf, "reading forest");
+      in
+        case readHelper buf of
+          NONE => Ok {
+            source = Source.success (buf, tok),
+            item = FOREST (Vector.fromList (List.rev res))
+          }
+        | SOME r => case r of
+          Err e => Err (Source.failure (buf, tok, e))
+        | Ok v => readForest (v :: res) buf
+      end
 
-    and readHelper (buf: Source.t): t option =
-      if Source.eof buf then NONE else
-      case Source.peek buf of
-        #"(" => readList buf
+    and readHelper (buf: Source.t): (t, string) result option =
+      if Source.eof buf then NONE
+      else case Source.peek buf of
+        #"(" => SOME (readList buf)
       | c =>
-        if isWhitespace c then (readHelper (Source.advance buf))
-        else if isAtomChar c then SOME (readAtom buf)
-        else NONE
+        if isWhitespace c then readHelper (Source.advance buf)
+        else if isAtomChar c then SOME (Ok (readAtom buf))
+        else SOME (Err "unexpected character")
   in
     val read = readForest []
   end
 end
 
+(*
 structure Parser :> sig
   type t
 
@@ -265,16 +371,17 @@ end = struct
     | Reader.ATOM "alias" => NONE
     | Reader.ATOM a => SOME (ATOM a)
 end
+*)
 
 fun main () =
   let
     val source = Source.fromStream TextIO.stdIn
-    (*
     val prog = Reader.read source
-    val repr = case prog of SOME p => Reader.pp p | NONE => "ERROR!!"
-    *)
+    val repr = case prog of Ok p => Reader.pp p | Err e => e
+    (*
     val parsed = Option.composePartial (Parser.parse, Reader.read) source
     val repr = case parsed of SOME p => Parser.pp p | NONE => "ERROR!!"
+    *)
   in TextIO.output (TextIO.stdOut, repr ^ "\n")
   end
 
