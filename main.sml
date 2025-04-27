@@ -1,14 +1,15 @@
 fun prn (str: string): unit = TextIO.output (TextIO.stdOut, str ^ "\n")
 
-infix >>=
 structure Result = struct
   datatype ('a, 'b) result = Ok of 'a | Err of 'b
 
+  infix >>=
   fun (r: ('a, 'c) result) >>= (f: 'a -> ('b, 'c) result): ('b, 'c) result =
     case r of Ok x => f x | Err e => Err e
 end
 
 open Result
+infix >>=
 
 (*
  * Fundamentals
@@ -54,8 +55,24 @@ structure Source = struct
   val big_line_pos = "internal error: attempting to convert pos to line and" ^
     " column when pos is pointing past the end of the buffer"
   val bad_token = "internal error: attempted to remove mark with invalid token"
+  val bad_prev = "internal error: attempted to step back before start of buffer"
 
   fun point (buf: t): Mark.t = !(#point buf)
+  fun prev_point (buf: t): Mark.t =
+    let
+      val { pos = p, line = l, col = c } = point buf
+      fun find_ll (pos, len) =
+        if pos = 0 then len
+        else case String.sub (#buf buf, pos) of
+            #"\n" => len
+          | _ => find_ll (pos - 1, len + 1)
+    in
+      if p = 0 then raise exc (bad_prev ^
+        "\nline: " ^ (Int.toString l) ^ ", col: " ^ (Int.toString c))
+      else case String.sub (#buf buf, p - 1) of
+          #"\n" => { pos = p - 1, line = l - 1, col = find_ll (p - 1, 1) }
+        | _ => { pos = p - 1, line = l, col = c - 1 }
+    end
   fun pos (buf: t): int = #pos (!(#point buf))
   fun line (buf: t): int = #line (!(#point buf))
   fun col (buf: t): int = #col (!(#point buf))
@@ -93,7 +110,7 @@ structure Source = struct
             "\nreceived: " ^ (Int.toString tok))
     in
       (* TODO: check for off by one-ish *)
-      { start = start, finish = (point buf) }
+      { start = start, finish = (prev_point buf) }
     end
 
   fun expected_token (buf: t, tok: token): bool =
@@ -103,6 +120,7 @@ structure Source = struct
 
   fun failure (buf: t, tok: token, msg: string): string =
     let
+      (* TODO: This *)
       fun build_msg (res, ms): string = msg
     in case !(#marks buf) of
         [] => raise exc (fail_no_start ^
@@ -362,7 +380,8 @@ end = struct
     case Reader.item r of
       Reader.FOREST ss =>
         let
-          fun f (_, Err e): (t vector, string) result = Err e
+          fun f (r, Err e) =
+              (case parse r of Err e' => Err (e ^ "\n" ^ e') | _ => Err e)
             | f (r, Ok rs) =
               parse r >>= (fn x => Ok (Vector.concat [rs, Vector.fromList [x]]))
           val init = Ok (Vector.fromList [])
@@ -394,10 +413,6 @@ end
 fun main () =
   let
     val source = Source.fromStream TextIO.stdIn
-    (*
-    val prog = Reader.read source
-    val repr = case prog of Ok p => Reader.pp p | Err e => e
-    *)
     val parsed = (Reader.read source) >>= Parser.parse
     val repr = case parsed of Ok p => Parser.pp p | Err e => e
   in TextIO.output (TextIO.stdOut, repr ^ "\n")
