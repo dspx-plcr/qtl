@@ -1,7 +1,11 @@
 fun prn (str: string): unit = TextIO.output (TextIO.stdOut, str ^ "\n")
 
+infix >>=
 structure Result = struct
   datatype ('a, 'b) result = Ok of 'a | Err of 'b
+
+  fun (r: ('a, 'c) result) >>= (f: 'a -> ('b, 'c) result): ('b, 'c) result =
+    case r of Ok x => f x | Err e => Err e
 end
 
 open Result
@@ -22,16 +26,26 @@ open Result
  * match    deconstruct a value
  *)
 
+(* TODO: Consider refactoring this into a functor *)
 structure Source = struct
+  structure Mark = struct
+    type t = { pos: int, line: int, col: int }
+
+    fun new_line { pos = p, line = l, col = c }: t =
+      { pos = p + 1, line = l + 1, col = 1 }
+    fun advance { pos = p, line = l, col = c }: t =
+      { pos = p + 1, line = l, col = c + 1 }
+  end
+
   type token = int
   type t = {
     buf: string,
-    pos: int ref,
-    marks: (string * int * token) list ref,
-    next_tok: int ref
+    point: Mark.t ref,
+    marks: (string * Mark.t * token) list ref,
+    next_tok: token ref
   }
 
-  type slice = { start: int, len: int }
+  type slice = { start: Mark.t, finish: Mark.t }
   exception exc of string
   val succeed_no_start = "internal error: attempting to succeed at reading" ^
     " without having started to read anything"
@@ -41,42 +55,26 @@ structure Source = struct
     " column when pos is pointing past the end of the buffer"
   val bad_token = "internal error: attempted to remove mark with invalid token"
 
+  fun point (buf: t): Mark.t = !(#point buf)
+  fun pos (buf: t): int = #pos (!(#point buf))
+  fun line (buf: t): int = #line (!(#point buf))
+  fun col (buf: t): int = #col (!(#point buf))
   fun eof (buf: t): bool =
-    (String.size (#buf buf) <= 0) orelse (String.size (#buf buf) <= !(#pos buf))
-  fun pos (buf: t): int = !(#pos buf)
-  fun peek (buf: t): char = String.sub (#buf buf, !(#pos buf))
+    (String.size (#buf buf) <= 0) orelse (String.size (#buf buf) <= pos buf)
+  fun peek (buf: t): char = String.sub (#buf buf, pos buf)
   fun try_peek (buf: t): char option =
     if eof buf then NONE else SOME (peek buf)
-  fun advance (buf: t): t = ((#pos buf) := !(#pos buf) + 1; buf)
+  fun advance (buf: t): t =
+    case try_peek buf of
+      NONE => buf
+    | SOME #"\n" => (#point buf := Mark.new_line (point buf); buf)
+    | SOME _ => (#point buf := Mark.advance (point buf); buf)
   fun substring (buf: t, i: int, j: int) = String.substring (#buf buf, i, j)
-
-  fun line_col ({ buf = buf, pos = pos, marks = marks, next_tok = _ }: t)
-    : int * int =
-    let
-      fun make_marks (ms, res) =
-        case ms of
-          [] => res
-        | (s,p,t)::ms' =>
-          let val res' = (res ^ "\n" ^ (Int.toString p) ^ ": " ^ s)
-          in make_marks (ms', res')
-          end
-      fun helper (l, l', p) =
-        if p = !pos then (l, p - l')
-        else if String.sub (buf, p) = #"\n" then helper (l+1, p+1, p+1)
-        else helper (l, l', p+1)
-    in
-      if String.size buf <= !pos
-      then raise exc (big_line_pos ^
-        "\nbuf size: " ^ (Int.toString (String.size buf)) ^
-        "\npos: " ^ (Int.toString (!pos)) ^
-        "\nmarks:\n" ^ (make_marks (!marks, "")))
-      else helper (1, 0, 0)
-    end
 
   fun start (buf: t, msg: string): token =
     let val tok = !(#next_tok buf)
     in (
-      (#marks buf) := (msg, !(#pos buf), tok) :: !(#marks buf);
+      (#marks buf) := (msg, point buf, tok) :: !(#marks buf);
       (#next_tok buf) := tok + 1;
       tok
     ) end
@@ -84,12 +82,9 @@ structure Source = struct
     let
       val marks = #marks buf
       val start = case !marks of
-          [] =>
-            let val (line, col) = line_col buf
-          in raise exc (succeed_no_start ^
-            "\nline: " ^ (Int.toString line) ^
-                ", col: " ^ (Int.toString col))
-            end
+          [] => raise exc (succeed_no_start ^
+            "\nline: " ^ (Int.toString (line buf)) ^
+            ", col: " ^ (Int.toString (col buf)))
         | ((_,p,t)::ms) =>
           if t = tok
           then (marks := ms; p)
@@ -98,7 +93,7 @@ structure Source = struct
             "\nreceived: " ^ (Int.toString tok))
     in
       (* TODO: check for off by one-ish *)
-      { start = start, len = !(#pos buf) - start - 1 }
+      { start = start, finish = (point buf) }
     end
 
   fun expected_token (buf: t, tok: token): bool =
@@ -110,12 +105,9 @@ structure Source = struct
     let
       fun build_msg (res, ms): string = msg
     in case !(#marks buf) of
-        [] => 
-        let val (line, col) = line_col buf
-        in raise exc (fail_no_start ^
-            "\nline: " ^ (Int.toString line) ^
-            ", col: " ^ (Int.toString col))
-        end
+        [] => raise exc (fail_no_start ^
+          "\nline: " ^ (Int.toString (line buf)) ^
+          ", col: " ^ (Int.toString (col buf)))
       | (m,p,t)::ms =>
         if t = tok
         then (#marks buf := ms; build_msg ("", !(#marks buf)))
@@ -125,7 +117,8 @@ structure Source = struct
     end
 
   fun fromString (str: string): t =
-    { buf = str, pos = ref 0, marks = ref [], next_tok = ref 0 }
+    { buf = str, point = ref { pos = 0, line = 1, col = 1 }, marks = ref [],
+      next_tok = ref 0 }
   fun fromStream (ss: TextIO.instream): t =
     let val str = TextIO.inputAll ss
     in fromString str
@@ -159,13 +152,15 @@ end = struct
   }
 end
 
-structure Reader : sig
+structure Reader :> sig
   type t
   datatype item =
     ATOM of string
   | LIST of t vector
   | FOREST of t vector
 
+  val source: t -> Source.slice
+  val item: t -> item
   val read: Source.t -> (t, string) result
   val pp: t -> string
 end = struct
@@ -176,6 +171,8 @@ end = struct
   | FOREST of t vector
   withtype t = { source: Source.slice, item: item }
 
+  fun source (t: t) = #source t
+  fun item (t: t) = #item t
 
   (* TODO: some chars can be after the initial pos but not in *)
   fun isAtomChar (c: char): bool =
@@ -281,14 +278,13 @@ end = struct
   end
 end
 
-(*
 structure Parser :> sig
   type t
 
   val pp: t -> string
-  val parse: Reader.t -> t option
+  val parse: Reader.t -> (t, string) result
 end = struct
-  datatype t =
+  datatype item =
     PRIMOP of primop
   | ATOM of string
   | LIST of t vector
@@ -305,9 +301,10 @@ end = struct
   | MATCH
   | EQUAL
   | PRIM
+  withtype t = { source: Source.slice, item: item }
 
   fun pp (p: t): string =
-    case p of
+    case #item p of
       PRIMOP p' => (
         case p' of
           CLAIM (s, t) => "(claim " ^ s ^ " " ^ (pp t) ^ ")"
@@ -324,64 +321,85 @@ end = struct
       in (fn (_, x) => x) (Vector.foldl f (true, "") l)
       end
 
-  fun parseClaim (ls: Reader.t vector): t option =
-    if Vector.length ls <> 3 then NONE
-    else case Vector.sub (ls, 1) of
-        Reader.ATOM a =>
-          Option.map (fn x => PRIMOP (CLAIM (a, x)))
-            (parse (Vector.sub (ls, 2)))
-      | _ => NONE
+  fun error (it: Reader.t, err: string): ('a, string) result =
+    let
+      val start = #start (Reader.source it)
+      val finish = #finish (Reader.source it)
+      val sl = Int.toString (#line start)
+      val sc = Int.toString (#col start)
+      val fl = Int.toString (#line finish)
+      val fc = Int.toString (#col finish)
+    in Err (sl ^ ":" ^ sc ^ "-" ^ fl ^ ":" ^ fc ^ " error: " ^ err)
+    end
 
-  and parseAlias (ls: Reader.t vector): t option =
-    if Vector.length ls <> 3 then NONE
-    else case Vector.sub (ls, 1) of
-        Reader.ATOM a =>
-          Option.map (fn x => PRIMOP (ALIAS (a, x)))
-            (parse (Vector.sub (ls, 2)))
-      | _ => NONE
+  fun parseClaim (ls: Reader.t vector): (t, string) result =
+    if Vector.length ls <> 3
+    then error (Vector.sub (ls, 0), "CLAIM must have exactly 2 arguments")
+    else let
+        val tok = Vector.sub (ls, 0)
+        val id = Vector.sub (ls, 1)
+        val expr = Vector.sub (ls, 2)
+      in case Reader.item id of
+          Reader.ATOM a => parse expr >>= (fn x =>
+            Ok { source = Reader.source tok, item = PRIMOP (CLAIM (a, x)) })
+        | _ => error (id, "first argument of CLAIM must be an identifier")
+      end
 
-  and parse (r: Reader.t): t option =
-    case r of
+  and parseAlias (ls: Reader.t vector): (t, string) result =
+    if Vector.length ls <> 3
+    then error (Vector.sub (ls, 0), "ALIAS must have exactly 2 arguments")
+    else let
+        val tok = Vector.sub (ls, 0)
+        val id = Vector.sub (ls, 1)
+        val expr = Vector.sub (ls, 2)
+      in case Reader.item id of
+          Reader.ATOM a => parse expr >>= (fn x =>
+            Ok { source = Reader.source tok, item = PRIMOP (ALIAS (a, x)) })
+        | _ => error (id, "first argument of ALIAS must be an identifier")
+      end
+
+  and parse (r: Reader.t): (t, string) result =
+    case Reader.item r of
       Reader.FOREST ss =>
         let
-          fun f (_, NONE) = NONE
-            | f (e, SOME vs) =
-              Option.map (fn x => Vector.concat [vs, Vector.fromList [x]])
-                (parse e)
-        in Option.map (fn x => FOREST x)
-          (Vector.foldl f (SOME (Vector.fromList [])) ss)
+          fun f (_, Err e): (t vector, string) result = Err e
+            | f (r, Ok rs) =
+              parse r >>= (fn x => Ok (Vector.concat [rs, Vector.fromList [x]]))
+          val init = Ok (Vector.fromList [])
+        in Vector.foldl f init ss >>=
+          (fn x => Ok { source = Reader.source r, item = FOREST x })
         end
     | Reader.LIST ls =>
-      if Vector.length ls = 0 then SOME (LIST (Vector.fromList []))
+      if Vector.length ls = 0
+      then Ok { source = Reader.source r, item = LIST (Vector.fromList []) }
       else (
-        case Vector.sub (ls, 0) of
+        case Reader.item (Vector.sub (ls, 0)) of
           Reader.ATOM "claim" => parseClaim ls
         | Reader.ATOM "alias" => parseAlias ls
         | _ =>
           let
-            fun f (_, NONE) = NONE
-              | f (e, SOME vs) =
-                Option.map (fn x => Vector.concat [vs, Vector.fromList [x]])
-                  (parse e)
-          in Option.map (fn x => LIST x)
-            (Vector.foldl f (SOME (Vector.fromList [])) ls)
+            fun f (_, Err e) = Err e
+              | f (e, Ok vs) = parse e >>=
+                (fn x => Ok (Vector.concat [vs, Vector.fromList [x]]))
+            val init = Ok (Vector.fromList [])
+          in Vector.foldl f init ls >>=
+            (fn x => Ok { source = Reader.source r, item = LIST x })
           end
       )
-    | Reader.ATOM "claim" => NONE
-    | Reader.ATOM "alias" => NONE
-    | Reader.ATOM a => SOME (ATOM a)
+    | Reader.ATOM "claim" => error (r, "CLAIM must be used as a function")
+    | Reader.ATOM "alias" => error (r, "ALIAS must be used as a function")
+    | Reader.ATOM a => Ok { source = Reader.source r, item = ATOM a }
 end
-*)
 
 fun main () =
   let
     val source = Source.fromStream TextIO.stdIn
+    (*
     val prog = Reader.read source
     val repr = case prog of Ok p => Reader.pp p | Err e => e
-    (*
-    val parsed = Option.composePartial (Parser.parse, Reader.read) source
-    val repr = case parsed of SOME p => Parser.pp p | NONE => "ERROR!!"
     *)
+    val parsed = (Reader.read source) >>= Parser.parse
+    val repr = case parsed of Ok p => Parser.pp p | Err e => e
   in TextIO.output (TextIO.stdOut, repr ^ "\n")
   end
 
