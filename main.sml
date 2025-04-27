@@ -8,6 +8,51 @@ structure Result = struct
     case r of Ok x => f x | Err e => Err e
 end
 
+structure Value :> sig
+  type t
+end = struct
+  datatype t =
+    LAM of unit
+  | PRIM of int
+end
+
+structure Type :> sig
+  type t
+end = struct
+  datatype t =
+    FUN of (t vector) * t
+  | SUM of t vector
+  | PROD of t vector
+end
+
+signature Hashable = sig
+  type t
+  val hash: t -> word
+end
+
+structure StringHasher: Hashable =
+struct
+  open Word
+  infix << +
+  type t = string
+  fun hash (s: string): word =
+    let fun f (c, h) = ((h << (Word.fromInt 5)) + h) + (Word.fromInt (ord c))
+    in CharVector.foldl f (Word.fromInt 5381) s
+    end
+end
+
+functor HashMap(
+  structure H: Hashable
+  type value
+) = struct
+  type key = H.t
+  type t = { buf: (key * value) list array, len: int, cap: int }
+
+  fun empty () = { buf = Array.array (7, []), len = 0, cap = 7 }
+  fun fold (f: (key * value) * 'a -> 'a) (acc: 'a) (tbl: t): 'a =
+    Array.foldl (fn (ls, acc) => List.foldl f acc ls) acc (#buf tbl)
+end
+
 open Result
 infix >>=
 
@@ -141,33 +186,6 @@ structure Source = struct
     let val str = TextIO.inputAll ss
     in fromString str
     end
-end
-
-structure Type :> sig
-  type t
-end = struct
-  datatype t =
-    FUN of (t vector) * t
-  | SUM of t vector
-  | PROD of t vector
-end
-
-structure Value :> sig
-  type t
-end = struct
-  datatype t =
-    LAM of unit
-  | PRIM of int
-end
-
-structure Ident :> sig
-  type t
-end = struct
-  type t = {
-    name: string,
-    qtype: Type.t,
-    value: Value.t
-  }
 end
 
 structure Reader :> sig
@@ -410,11 +428,31 @@ end = struct
     | Reader.ATOM a => Ok { source = Reader.source r, item = ATOM a }
 end
 
+structure Typer :> sig
+  type t
+  val print_table: t -> string
+  val check: Parser.t -> (t, string) result
+end = struct
+  structure IdTable = HashMap(
+    type value = { orig: string, norm: Type.t }
+    structure H = StringHasher)
+
+  type t = {
+    ids: IdTable.t
+  }
+
+  fun print_table ({ ids }: t): string =
+    IdTable.fold (fn ((k,v), str) => str ^ "\n" ^ k ^ ": " ^ (#orig v)) "" ids
+
+  fun check (p: Parser.t): (t, string) result =
+    Err "type checking is not yet implemented"
+end
+
 fun main () =
   let
     val source = Source.fromStream TextIO.stdIn
-    val parsed = (Reader.read source) >>= Parser.parse
-    val repr = case parsed of Ok p => Parser.pp p | Err e => e
+    val checked = (Reader.read source) >>= Parser.parse >>= Typer.check
+    val repr = case checked of Ok t => Typer.print_table t | Err e => e
   in TextIO.output (TextIO.stdOut, repr ^ "\n")
   end
 
