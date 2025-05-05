@@ -47,10 +47,16 @@ functor HashMap(
 ) = struct
   type key = H.t
   type t = { buf: (key * value) list array, len: int, cap: int }
+  datatype ins_or_get = INSERT of t | GET of value
 
   fun empty () = { buf = Array.array (7, []), len = 0, cap = 7 }
   fun fold (f: (key * value) * 'a -> 'a) (acc: 'a) (tbl: t): 'a =
     Array.foldl (fn (ls, acc) => List.foldl f acc ls) acc (#buf tbl)
+
+  exception unimplemented
+  fun tryGet (tbl: t, k: key): value option = raise unimplemented
+  fun insert (tbl: t, k: key, v: value): t = raise unimplemented
+  fun insertOrGet (tbl: t, k: key, v: value): ins_or_get = raise unimplemented
 end
 
 open Result
@@ -316,8 +322,27 @@ end
 
 structure Parser :> sig
   type t
+  datatype item =
+    PRIMOP of primop
+  | ATOM of string
+  | LIST of t vector
+  | FOREST of t vector
+
+  and primop =
+    CLAIM of string * t
+  | ALIAS of string * t
+  | LAMBDA
+  | FUNCTION
+  | BIND
+  | SUM
+  | PROD
+  | MATCH
+  | EQUAL
+  | PRIM
 
   val pp: t -> string
+  val source: t -> Source.slice
+  val item: t -> item
   val parse: Reader.t -> (t, string) result
 end = struct
   datatype item =
@@ -356,6 +381,9 @@ end = struct
       let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else "\n") ^ (pp e))
       in (fn (_, x) => x) (Vector.foldl f (true, "") l)
       end
+
+  fun source (p: t): Source.slice = #source p
+  fun item (p: t): item = #item p
 
   fun error (it: Reader.t, err: string): ('a, string) result =
     let
@@ -434,18 +462,48 @@ structure Typer :> sig
   val check: Parser.t -> (t, string) result
 end = struct
   structure IdTable = HashMap(
-    type value = { orig: string, norm: Type.t }
+    type value = { orig: Parser.t, norm: Type.t }
     structure H = StringHasher)
 
   type t = {
-    ids: IdTable.t
+    ids: IdTable.t,
+    code: Parser.t
   }
 
-  fun print_table ({ ids }: t): string =
-    IdTable.fold (fn ((k,v), str) => str ^ "\n" ^ k ^ ": " ^ (#orig v)) "" ids
+  fun print_table ({ ids, code }: t): string =
+    IdTable.fold
+      (fn ((k,v), str) => str ^ "\n" ^ k ^ ": " ^ (Parser.pp (#orig v)))
+      "" ids
 
+  fun normalise (tbl: IdTable.t, p: Parser.t): (Type.t, string) result =
+    Err "normalisation unimplemented"
+
+  exception unimplemented
   fun check (p: Parser.t): (t, string) result =
-    Err "type checking is not yet implemented"
+    let
+      fun wrap (t: IdTable.t, id: string, orig: Parser.t) (ty: Type.t) =
+        case IdTable.insertOrGet (t, id, { orig = orig, norm = ty }) of
+          IdTable.INSERT t => Ok t
+        | IdTable.GET p => Err "bad wrap, implement this"
+          (* print source information for debugging *)
+      fun helper (it: Parser.t, tbl: IdTable.t): (IdTable.t, string) result =
+        case Parser.item it of
+          Parser.FOREST ls =>
+            let fun f (x, acc) = case acc of Ok a => helper (x, a) | y => y
+            in Vector.foldl f (Ok tbl) ls
+            end
+        | Parser.PRIMOP (Parser.CLAIM (id, x)) =>
+          normalise (tbl, x) >>= wrap (tbl, id, x)
+        | Parser.PRIMOP (Parser.ALIAS (id, x)) => (
+            case IdTable.tryGet (tbl, id) of
+              NONE => raise unimplemented
+            | SOME ty => raise unimplemented
+          )
+        | _ => Ok tbl
+    in case helper (p, IdTable.empty ()) of
+        Ok a => Ok { ids = a, code = p }
+      | Err y => Err y
+    end
 end
 
 fun main () =
