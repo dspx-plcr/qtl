@@ -1,4 +1,5 @@
 fun prn (str: string): unit = TextIO.output (TextIO.stdOut, str ^ "\n")
+exception unimplemented of string
 
 structure Result = struct
   datatype ('a, 'b) result = Ok of 'a | Err of 'b
@@ -17,16 +18,23 @@ end = struct
 end
 
 structure Type :> sig
-  type t
+  datatype t =
+    FUN of (t vector) * t
+  | SUM of t vector
+  | PROD of t vector
+
+  val pp: t -> string
 end = struct
   datatype t =
     FUN of (t vector) * t
   | SUM of t vector
   | PROD of t vector
+
+  fun pp (t: t): string = raise unimplemented "Type.pp"
 end
 
 signature Hashable = sig
-  type t
+  eqtype t
   val hash: t -> word
 end
 
@@ -46,17 +54,26 @@ functor HashMap(
   type value
 ) = struct
   type key = H.t
-  type t = { buf: (key * value) list array, len: int, cap: int }
+  type t = { buf: (word * key * value) list array, len: int ref, cap: int ref }
   datatype ins_or_get = INSERT of t | GET of value
 
-  fun empty () = { buf = Array.array (7, []), len = 0, cap = 7 }
-  fun fold (f: (key * value) * 'a -> 'a) (acc: 'a) (tbl: t): 'a =
+  fun empty () = { buf = Array.array (7, []), len = ref 0, cap = ref 7 }
+  fun fold (f: (word * key * value) * 'a -> 'a) (acc: 'a) (tbl: t): 'a =
     Array.foldl (fn (ls, acc) => List.foldl f acc ls) acc (#buf tbl)
 
-  exception unimplemented
-  fun tryGet (tbl: t, k: key): value option = raise unimplemented
-  fun insert (tbl: t, k: key, v: value): t = raise unimplemented
-  fun insertOrGet (tbl: t, k: key, v: value): ins_or_get = raise unimplemented
+  fun tryGet ({ buf, len = ref len, cap = ref cap }: t, k: key): value option =
+    let
+      val h = H.hash k
+      val idx = Word.toInt (Word.mod (h, Word.fromInt cap))
+      fun f (_, SOME x) = SOME x
+        | f ((h', k', v'), _) =
+          if h <> h' orelse k <> k' then NONE else SOME v'
+    in List.foldl f NONE (Array.sub (buf, idx))
+    end
+
+  fun insert (tbl: t, k: key, v: value): t = raise unimplemented "insert"
+  fun insertOrGet (tbl: t, k: key, v: value): ins_or_get =
+    raise unimplemented "insertOrGet"
 end
 
 open Result
@@ -325,7 +342,7 @@ structure Parser :> sig
   datatype item =
     PRIMOP of primop
   | ATOM of string
-  | LIST of t vector
+  | FUNCALL of t * (t vector)
   | FOREST of t vector
 
   and primop =
@@ -348,7 +365,7 @@ end = struct
   datatype item =
     PRIMOP of primop
   | ATOM of string
-  | LIST of t vector
+  | FUNCALL of t * (t vector)
   | FOREST of t vector
 
   and primop =
@@ -373,9 +390,10 @@ end = struct
         | _ => "unimplemented"
       )
     | ATOM a => a
-    | LIST l =>
+    | FUNCALL (fname, l) =>
       let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else " ") ^ (pp e))
-      in "(" ^ ((fn (_, x) => x) (Vector.foldl f (true, "") l)) ^ ")"
+      in "(" ^ (pp fname) ^ " " ^
+        ((fn (_, x) => x) (Vector.foldl f (true, "") l)) ^ ")"
       end
     | FOREST l =>
       let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else "\n") ^ (pp e))
@@ -436,20 +454,31 @@ end = struct
         end
     | Reader.LIST ls =>
       if Vector.length ls = 0
-      then Ok { source = Reader.source r, item = LIST (Vector.fromList []) }
+      then error (r, "empty function call. Did you mean the empty list, Nil?")
       else (
-        case Reader.item (Vector.sub (ls, 0)) of
-          Reader.ATOM "claim" => parseClaim ls
-        | Reader.ATOM "alias" => parseAlias ls
-        | _ =>
-          let
-            fun f (_, Err e) = Err e
-              | f (e, Ok vs) = parse e >>=
-                (fn x => Ok (Vector.concat [vs, Vector.fromList [x]]))
-            val init = Ok (Vector.fromList [])
-          in Vector.foldl f init ls >>=
-            (fn x => Ok { source = Reader.source r, item = LIST x })
-          end
+        let
+          val fst = Vector.sub (ls, 0)
+          fun p ls =
+            let
+              fun f (_, _, Err e) = Err e
+                | f (0, _, a) = a
+                | f (_, e, Ok vs) = parse e >>=
+                  (fn x => Ok (Vector.concat [vs, Vector.fromList [x]]))
+              val init = Ok (Vector.fromList [])
+            in Vector.foldli f init ls
+            end
+        in case Reader.item fst of
+            Reader.FOREST _ =>
+              error (fst, "internal error: found a forest inside a list")
+          | Reader.LIST ls => parse fst >>= (fn fst => p ls >>= (fn rst =>
+              Ok { source = Reader.source r, item = FUNCALL (fst, rst) }))
+          | Reader.ATOM "claim" => parseClaim ls
+          | Reader.ATOM "alias" => parseAlias ls
+          | Reader.ATOM a => p ls >>= (fn rst =>
+              let val fst = { source = Reader.source fst, item = ATOM a }
+              in Ok { source = Reader.source r, item = FUNCALL (fst, rst) }
+              end)
+        end
       )
     | Reader.ATOM "claim" => error (r, "CLAIM must be used as a function")
     | Reader.ATOM "alias" => error (r, "ALIAS must be used as a function")
@@ -472,32 +501,70 @@ end = struct
 
   fun print_table ({ ids, code }: t): string =
     IdTable.fold
-      (fn ((k,v), str) => str ^ "\n" ^ k ^ ": " ^ (Parser.pp (#orig v)))
+      (fn ((_,k,v), str) => str ^ "\n" ^ k ^ ": " ^ (Parser.pp (#orig v)))
       "" ids
 
-  fun normalise (tbl: IdTable.t, p: Parser.t): (Type.t, string) result =
-    Err "normalisation unimplemented"
+  fun error (p: Parser.t, err: string): ('a, string) result =
+    let
+      val start = #start (Parser.source p)
+      val finish = #finish (Parser.source p)
+      val sl = Int.toString (#line start)
+      val sc = Int.toString (#col start)
+      val fl = Int.toString (#line finish)
+      val fc = Int.toString (#col finish)
+    in Err (sl ^ ":" ^ sc ^ "-" ^ fl ^ ":" ^ fc ^ " error: " ^ err)
+    end
 
-  exception unimplemented
+  (* TODO: should this be combined with the helper function? *)
+  fun normalise (tbl: IdTable.t, p: Parser.t): (Type.t, string) result =
+    case Parser.item p of
+      Parser.FOREST _ =>
+        error (p, "internal error: unexpected FOREST during type normalisation")
+    | Parser.PRIMOP pop => (
+        case pop of
+          Parser.CLAIM _ => error (p,
+            "internal error: unexpected CLAIM during type normalisation")
+        | Parser.ALIAS _ => error (p,
+            "internal error: unexpected ALIAS during type normalisation")
+        | _ => raise unimplemented "norm primop"
+      )
+    | Parser.ATOM a => (
+        case IdTable.tryGet (tbl, a) of
+          SOME { orig, norm } => Ok norm
+        | NONE => error (p, "encountered identifier without declared type")
+      )
+    | Parser.FUNCALL (fst, rst) => normalise (tbl, fst) >>= (
+        fn (Type.FUN (args, ret)) =>
+            if Vector.length rst <> Vector.length args
+            then error (p, "function expected " ^
+              (Int.toString (Vector.length args)) ^ " arguments")
+            else raise unimplemented "normalise function"
+        | ty => error (fst,
+            "expected FUNCTION type but found\n" ^ (Type.pp ty))
+      )
+
   fun check (p: Parser.t): (t, string) result =
     let
       fun wrap (t: IdTable.t, id: string, orig: Parser.t) (ty: Type.t) =
         case IdTable.insertOrGet (t, id, { orig = orig, norm = ty }) of
           IdTable.INSERT t => Ok t
         | IdTable.GET p => Err "bad wrap, implement this"
-          (* print source information for debugging *)
+          (* TODO: print source information for debugging *)
       fun helper (it: Parser.t, tbl: IdTable.t): (IdTable.t, string) result =
         case Parser.item it of
           Parser.FOREST ls =>
-            let fun f (x, acc) = case acc of Ok a => helper (x, a) | y => y
+            let fun f (x, acc) = acc >>= (fn a => helper (x, a))
             in Vector.foldl f (Ok tbl) ls
             end
-        | Parser.PRIMOP (Parser.CLAIM (id, x)) =>
-          normalise (tbl, x) >>= wrap (tbl, id, x)
-        | Parser.PRIMOP (Parser.ALIAS (id, x)) => (
-            case IdTable.tryGet (tbl, id) of
-              NONE => raise unimplemented
-            | SOME ty => raise unimplemented
+        | Parser.PRIMOP pop => (
+            case pop of
+              Parser.CLAIM (id, x) => normalise (tbl, x) >>= wrap (tbl, id, x)
+            | Parser.ALIAS (id, x) => (
+                case IdTable.tryGet (tbl, id) of
+                  NONE => raise unimplemented "check alias"
+                | SOME ty => raise unimplemented "check alias"
+              )
+            | _ => raise unimplemented "check primop"
           )
         | _ => Ok tbl
     in case helper (p, IdTable.empty ()) of
