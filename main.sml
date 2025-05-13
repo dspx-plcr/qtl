@@ -9,14 +9,6 @@ structure Result = struct
     case r of Ok x => f x | Err e => Err e
 end
 
-structure Value :> sig
-  type t
-end = struct
-  datatype t =
-    LAM of unit
-  | PRIM of int
-end
-
 structure Type :> sig
   datatype t =
     FUN of (t vector) * t
@@ -24,16 +16,47 @@ structure Type :> sig
   | PROD of t vector
     (* TODO: uint? *)
   | LEVEL of int
+  | PRIM
 
   val pp: t -> string
+  val result: t -> t
 end = struct
   datatype t =
     FUN of (t vector) * t
   | SUM of t vector
   | PROD of t vector
   | LEVEL of int
+  | PRIM
 
-  fun pp (t: t): string = raise unimplemented "Type.pp"
+  fun pp (t: t): string =
+    case t of
+      FUN (args, ret) => raise unimplemented "Type.pp fun"
+    | SUM ss =>
+      let fun f (s, acc) = acc ^ " " ^ (pp s)
+      in "(sum" ^ (Vector.foldl f "" ss) ^ ")"
+      end
+    | PROD ps => raise unimplemented "Type.pp prod"
+    | LEVEL l => "(Type " ^ (Int.toString l) ^ ")"
+    | PRIM => "(prim)"
+
+  fun result (FUN (_, r)) = r
+    | result r = r
+end
+
+structure Value :> sig
+  datatype t =
+    LAM of unit
+  | PRIM of int
+
+  val pp: t -> string
+  val typeof: t -> Type.t
+end = struct
+  datatype t =
+    LAM of unit
+  | PRIM of int
+
+  fun pp _ = raise unimplemented "Value.pp"
+  fun typeof _ = raise unimplemented "Value.typeof"
 end
 
 signature Hashable = sig
@@ -375,11 +398,11 @@ structure Parser :> sig
   | LAMBDA
   | FUNCTION
   | BIND
-  | SUM
+  | SUM of t vector
   | PROD
   | MATCH
   | EQUAL
-  | PRIM
+  | PRIM of string
   | TYPE of int
 
   val pp: t -> string
@@ -399,11 +422,11 @@ end = struct
   | LAMBDA
   | FUNCTION
   | BIND
-  | SUM
+  | SUM of t vector
   | PROD
   | MATCH
   | EQUAL
-  | PRIM
+  | PRIM of string
   | TYPE of int
   withtype t = { source: Source.slice, item: item }
 
@@ -414,6 +437,11 @@ end = struct
           CLAIM (s, t) => "(claim " ^ s ^ " " ^ (pp t) ^ ")"
         | ALIAS (s, t) => "(alias " ^ s ^ " " ^ (pp t) ^ ")"
         | TYPE l => "(Type " ^ (Int.toString l) ^ ")"
+        | SUM ss =>
+          let fun f (e, acc) = acc ^ " " ^ (pp e)
+          in "(sum" ^ (Vector.foldl f "" ss) ^ ")"
+          end
+        | PRIM id => "(prim " ^ id ^ ")"
         | _ => raise unimplemented "Parser.pp primop"
       )
     | ATOM a => a
@@ -441,7 +469,10 @@ end = struct
     in Err (sl ^ ":" ^ sc ^ "-" ^ fl ^ ":" ^ fc ^ " error: " ^ err)
     end
 
-  fun parseClaim (ls: Reader.t vector): (t, string) result =
+  fun add_source (r: Reader.t) (i: item): (t, 'a) result =
+    Ok { source = Reader.source r, item = i }
+
+  fun parseClaim (ls: Reader.t vector): (item, string) result =
     if Vector.length ls <> 3
     then error (Vector.sub (ls, 0), "CLAIM must have exactly 2 arguments")
     else let
@@ -449,12 +480,11 @@ end = struct
         val id = Vector.sub (ls, 1)
         val expr = Vector.sub (ls, 2)
       in case Reader.item id of
-          Reader.ATOM a => parse expr >>= (fn x =>
-            Ok { source = Reader.source tok, item = PRIMOP (CLAIM (a, x)) })
+          Reader.ATOM a => parse expr >>= (fn x => Ok (PRIMOP (CLAIM (a, x))))
         | _ => error (id, "first argument of CLAIM must be an identifier")
       end
 
-  and parseAlias (ls: Reader.t vector): (t, string) result =
+  and parseAlias (ls: Reader.t vector): (item, string) result =
     if Vector.length ls <> 3
     then error (Vector.sub (ls, 0), "ALIAS must have exactly 2 arguments")
     else let
@@ -462,14 +492,13 @@ end = struct
         val id = Vector.sub (ls, 1)
         val expr = Vector.sub (ls, 2)
       in case Reader.item id of
-          Reader.ATOM a => parse expr >>= (fn x =>
-            Ok { source = Reader.source tok, item = PRIMOP (ALIAS (a, x)) })
+          Reader.ATOM a => parse expr >>= (fn x => Ok (PRIMOP (ALIAS (a, x))))
         | _ => error (id, "first argument of ALIAS must be an identifier")
       end
 
   and parseType (ls: Reader.t vector): (t, string) result =
     if Vector.length ls <> 2
-    then error (Vector.sub (ls, 0), "Type expects exactly one argument")
+    then error (Vector.sub (ls, 0), "Type must have exactly 1 argument")
     else let
         val lvl = Vector.sub (ls, 1)
         fun err () = error (lvl, "Type expects a non-negative int argument")
@@ -484,7 +513,28 @@ end = struct
         | _ => err ()
       end
 
+  and parseSum (ls: Reader.t vector): (item, string) result =
+    if Vector.length ls < 2
+    then error (Vector.sub (ls, 0), "sum expects at least one argument")
+    else let
+        fun f (0, _, acc) = acc
+          | f (_, _, Err e) = Err e
+          | f (_, v, Ok acc) = parse v >>= (fn v => Ok (v :: acc))
+      in Vector.foldli f (Ok []) ls >>= (fn vs =>
+        Ok (PRIMOP (SUM (Vector.fromList vs))))
+      end
+
+  and parsePrim (ls: Reader.t vector): (item, string) result =
+    if Vector.length ls <> 2
+    then error (Vector.sub (ls, 0), "PRIM must have exactly 1 argument")
+    else let val name = Vector.sub (ls, 1)
+      in case Reader.item name of
+          Reader.ATOM a => Ok (PRIMOP (PRIM a))
+        | _ => error (name, "PRIM argument must be an identifier")
+      end
+
   and parse (r: Reader.t): (t, string) result =
+    (* TODO: some work is needed here to ensure CLAIM, etc are only top-level *)
     case Reader.item r of
       Reader.FOREST ss =>
         let
@@ -516,9 +566,11 @@ end = struct
               error (fst, "internal error: found a forest inside a list")
           | Reader.LIST ls => parse fst >>= (fn fst => p ls >>= (fn rst =>
               Ok { source = Reader.source r, item = FUNCALL (fst, rst) }))
-          | Reader.ATOM "claim" => parseClaim ls
-          | Reader.ATOM "alias" => parseAlias ls
+          | Reader.ATOM "claim" => parseClaim ls >>= add_source r
+          | Reader.ATOM "alias" => parseAlias ls >>= add_source r
           | Reader.ATOM "Type" => parseType ls
+          | Reader.ATOM "sum" => parseSum ls >>= add_source r
+          | Reader.ATOM "prim" => parsePrim ls >>= add_source r
           | Reader.ATOM a => p ls >>= (fn rst =>
               let val fst = { source = Reader.source fst, item = ATOM a }
               in Ok { source = Reader.source r, item = FUNCALL (fst, rst) }
@@ -527,29 +579,36 @@ end = struct
       )
     | Reader.ATOM "claim" => error (r, "CLAIM must be used as a function")
     | Reader.ATOM "alias" => error (r, "ALIAS must be used as a function")
+    | Reader.ATOM "sum" => error (r, "SUM must be used as a function")
+    | Reader.ATOM "prim" => error (r, "PRIM must be used as a function")
     | Reader.ATOM a => Ok { source = Reader.source r, item = ATOM a }
 end
 
 structure Typer :> sig
   type t
-  val print_table: t -> string
+  val print_tables: t -> string
   val check: Parser.t -> (t, string) result
 end = struct
-  structure IdTable = HashMap(
+  structure TypeTable = HashMap(
     type value = { orig: Parser.t, norm: Type.t }
     structure H = StringHasher)
+  structure ValueTable = HashMap(
+    type value = { orig: Parser.t, def: Value.t }
+    structure H = StringHasher)
 
+  type tables = { types: TypeTable.t, values: ValueTable.t }
   type t = {
-    ids: IdTable.t,
+    types: TypeTable.t,
+    values: ValueTable.t,
     code: Parser.t
   }
 
-  fun print_table ({ ids, code }: t): string =
-    IdTable.fold
+  fun print_tables ({ types, values, code }: t): string =
+    TypeTable.fold
       (fn ((_,k,v), str) => str ^ "\n" ^ k ^ ": " ^ (Parser.pp (#orig v)))
-      "" ids
+      "" types
 
-  fun error (p: Parser.t, err: string): ('a, string) result =
+  fun err_pos (p: Parser.t): string =
     let
       val start = #start (Parser.source p)
       val finish = #finish (Parser.source p)
@@ -557,11 +616,14 @@ end = struct
       val sc = Int.toString (#col start)
       val fl = Int.toString (#line finish)
       val fc = Int.toString (#col finish)
-    in Err (sl ^ ":" ^ sc ^ "-" ^ fl ^ ":" ^ fc ^ " error: " ^ err)
+    in sl ^ ":" ^ sc ^ "-" ^ fl ^ ":" ^ fc
     end
 
+  fun error (p: Parser.t, err: string): ('a, string) result =
+     Err ((err_pos p) ^ " error: " ^ err)
+
   (* TODO: should this be combined with the helper function? *)
-  fun normalise (tbl: IdTable.t, p: Parser.t): (Type.t, string) result =
+  fun normalise (state: tables, p: Parser.t): (Type.t, string) result =
     case Parser.item p of
       Parser.FOREST _ =>
         error (p, "internal error: unexpected FOREST during type normalisation")
@@ -572,14 +634,26 @@ end = struct
         | Parser.ALIAS _ => error (p,
             "internal error: unexpected ALIAS during type normalisation")
         | Parser.TYPE x => Ok (Type.LEVEL x)
+        | Parser.SUM ss => normalise (state, (Vector.sub (ss, 0))) >>=
+          (fn fst => let
+            fun f (0, _, Ok acc) = Ok acc
+              | f (_, _, Err e) = Err e
+              | f (_, s, Ok acc) = normalise (state, s) >>= (fn s' =>
+                if (Type.result fst) = (Type.result s')
+                then Ok (s' :: acc)
+                else error (s, "expecting a type compatible with `"
+                  ^ (Type.pp fst) ^ "`, but found type `" ^ (Type.pp s') ^ "`"))
+          in Vector.foldli f (Ok []) ss >>= (fn ss =>
+            Ok (Type.SUM (Vector.fromList (fst :: (List.rev ss)))))
+          end)
         | _ => raise unimplemented "norm primop"
       )
     | Parser.ATOM a => (
-        case IdTable.tryGet (tbl, a) of
-          SOME { orig, norm } => Ok norm
+        case ValueTable.tryGet (#values state, a) of
+          SOME { orig, def } => Ok (Value.typeof def)
         | NONE => error (p, "encountered identifier without declared type")
       )
-    | Parser.FUNCALL (fst, rst) => normalise (tbl, fst) >>= (
+    | Parser.FUNCALL (fst, rst) => normalise (state, fst) >>= (
         fn (Type.FUN (args, ret)) =>
             if Vector.length rst <> Vector.length args
             then error (p, "function expected " ^
@@ -589,32 +663,75 @@ end = struct
             "expected FUNCTION type but found\n" ^ (Type.pp ty))
       )
 
+  fun get_type (state: tables, p: Parser.t): (Type.t, string) result =
+    case Parser.item p of
+      Parser.FOREST _ =>
+        error (p, "internal error: unexpected FOREST during typing")
+    | Parser.PRIMOP pop => (
+        case pop of
+          Parser.CLAIM _ => 
+            error (p, "internal error: unexpected CLAIM during typing")
+        | Parser.ALIAS _ =>
+            error (p, "internal error: unexpected ALIAS during typing")
+        | Parser.TYPE x => Ok (Type.LEVEL (x + 1))
+        | Parser.PRIM _ => Ok (Type.LEVEL 0)
+        | Parser.SUM ss =>
+          let
+            fun f (_, Err e) = Err e
+              | f (s, Ok lvl) = get_type (state, s) >>= (
+                fn Type.LEVEL l => Ok (if l > lvl then l else lvl)
+                 | _ => Ok 0)
+          in Vector.foldl f (Ok 0) ss >>= (fn lvl => Ok (Type.LEVEL lvl))
+          end
+        | _ => raise unimplemented "Typer.get_type primop"
+      )
+    | _ => raise unimplemented "Typer.get_type top-level"
+
   fun check (p: Parser.t): (t, string) result =
     let
-      fun wrap (t: IdTable.t, id: string, orig: Parser.t) (ty: Type.t) =
-        case IdTable.insertOrGet (t, id, { orig = orig, norm = ty }) of
-          IdTable.INSERT t => Ok t
-        | IdTable.GET p => raise unimplemented "type check wrap get"
-          (* TODO: print source information for debugging *)
-      fun helper (it: Parser.t, tbl: IdTable.t): (IdTable.t, string) result =
+      fun wrapty
+        ({ types, values }: tables, id: string, orig: Parser.t) (ty: Type.t)
+      =
+        case TypeTable.insertOrGet (types, id, { orig = orig, norm = ty }) of
+          TypeTable.INSERT t => Ok { values = values, types = t }
+        | TypeTable.GET p => raise unimplemented "type check wrap type get"
+      fun wrapva
+        ({ types, values }: tables, id: string, orig: Parser.t) (va: Value.t)
+      =
+        case ValueTable.insertOrGet (values, id, { orig = orig, def = va }) of
+          ValueTable.INSERT v => Ok { values = v, types = types }
+        | ValueTable.GET p => raise unimplemented "type check wrap value get"
+
+      fun helper (it: Parser.t, state: tables): (tables, string) result =
         case Parser.item it of
           Parser.FOREST ls =>
             let fun f (x, acc) = acc >>= (fn a => helper (x, a))
-            in Vector.foldl f (Ok tbl) ls
+            in Vector.foldl f (Ok state) ls
             end
         | Parser.PRIMOP pop => (
             case pop of
-              Parser.CLAIM (id, x) => normalise (tbl, x) >>= wrap (tbl, id, x)
+              Parser.CLAIM (id, x) =>
+                normalise (state, x) >>= wrapty (state, id, x)
             | Parser.ALIAS (id, x) => (
-                case IdTable.tryGet (tbl, id) of
+                case TypeTable.tryGet (#types state, id) of
                   NONE => raise unimplemented "check alias"
-                | SOME ty => raise unimplemented "check alias"
+                | SOME tyl => get_type (state, x) >>= (fn tyr =>
+                  let
+                    val a = ""
+                  in
+                    error (it, "type mismatch: `" ^ id ^ "`"
+                      ^ " previously declared as `"
+                      ^ (Parser.pp (#orig tyl)) ^ "` at "
+                      ^ (err_pos (#orig tyl)) ^ ", but `" ^ (Parser.pp x)
+                      ^ "` is of type `" ^ (Type.pp tyr) ^ "`")
+                  end)
               )
             | _ => raise unimplemented "check primop"
           )
-        | _ => Ok tbl
-    in case helper (p, IdTable.empty ()) of
-        Ok a => Ok { ids = a, code = p }
+        | _ => Ok state
+      val init = { values = ValueTable.empty (), types = TypeTable.empty () }
+    in case helper (p, init) of
+        Ok { types, values } => Ok { types = types, values = values, code = p }
       | Err y => Err y
     end
 end
@@ -623,7 +740,7 @@ fun main () =
   let
     val source = Source.fromStream TextIO.stdIn
     val checked = (Reader.read source) >>= Parser.parse >>= Typer.check
-    val repr = case checked of Ok t => Typer.print_table t | Err e => e
+    val repr = case checked of Ok t => Typer.print_tables t | Err e => e
   in TextIO.output (TextIO.stdOut, repr ^ "\n")
   end
 
