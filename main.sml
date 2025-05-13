@@ -22,6 +22,8 @@ structure Type :> sig
     FUN of (t vector) * t
   | SUM of t vector
   | PROD of t vector
+    (* TODO: uint? *)
+  | LEVEL of int
 
   val pp: t -> string
 end = struct
@@ -29,6 +31,7 @@ end = struct
     FUN of (t vector) * t
   | SUM of t vector
   | PROD of t vector
+  | LEVEL of int
 
   fun pp (t: t): string = raise unimplemented "Type.pp"
 end
@@ -57,23 +60,44 @@ functor HashMap(
   type t = { buf: (word * key * value) list array, len: int ref, cap: int ref }
   datatype ins_or_get = INSERT of t | GET of value
 
+  fun get_idx (buf: t, k: key): int =
+    Word.toInt (Word.mod (H.hash k, Word.fromInt (!(#cap buf))))
+
   fun empty () = { buf = Array.array (7, []), len = ref 0, cap = ref 7 }
   fun fold (f: (word * key * value) * 'a -> 'a) (acc: 'a) (tbl: t): 'a =
     Array.foldl (fn (ls, acc) => List.foldl f acc ls) acc (#buf tbl)
 
-  fun tryGet ({ buf, len = ref len, cap = ref cap }: t, k: key): value option =
-    let
+  fun grow ({ buf, len = ref len, cap = ref cap }: t): t =
+    raise unimplemented "bleh"
+
+  fun tryGet
+    (tbl as { buf, len = ref len, cap = ref cap }: t, k: key): value option
+  = let
       val h = H.hash k
-      val idx = Word.toInt (Word.mod (h, Word.fromInt cap))
       fun f (_, SOME x) = SOME x
         | f ((h', k', v'), _) =
           if h <> h' orelse k <> k' then NONE else SOME v'
-    in List.foldl f NONE (Array.sub (buf, idx))
+    in List.foldl f NONE (Array.sub (buf, get_idx (tbl, k)))
     end
 
-  fun insert (tbl: t, k: key, v: value): t = raise unimplemented "insert"
+  fun insert
+    (tbl as { buf, len = ref len, cap = ref cap }: t, k: key, v: value): t
+  = let
+      val tbl' = if (Real.fromInt len) > 0.8 * (Real.fromInt cap)
+        then grow tbl
+        else tbl
+      val idx = get_idx (tbl', k)
+      fun f ([], ys) = (H.hash k, k, v) :: ys
+        | f ((x as (h',k',v'))::xs, ys) =
+          if k' = k then (h',k,v)::ys else f (xs, x::ys)
+      val bucket = f (Array.sub (#buf tbl', idx), [])
+    in (Array.update (#buf tbl', idx, bucket); #len tbl' := len + 1; tbl')
+    end
+
   fun insertOrGet (tbl: t, k: key, v: value): ins_or_get =
-    raise unimplemented "insertOrGet"
+    case tryGet (tbl, k) of
+      SOME v' => GET v'
+    | NONE => INSERT (insert (tbl, k, v))
 end
 
 open Result
@@ -356,6 +380,7 @@ structure Parser :> sig
   | MATCH
   | EQUAL
   | PRIM
+  | TYPE of int
 
   val pp: t -> string
   val source: t -> Source.slice
@@ -379,6 +404,7 @@ end = struct
   | MATCH
   | EQUAL
   | PRIM
+  | TYPE of int
   withtype t = { source: Source.slice, item: item }
 
   fun pp (p: t): string =
@@ -387,7 +413,8 @@ end = struct
         case p' of
           CLAIM (s, t) => "(claim " ^ s ^ " " ^ (pp t) ^ ")"
         | ALIAS (s, t) => "(alias " ^ s ^ " " ^ (pp t) ^ ")"
-        | _ => "unimplemented"
+        | TYPE l => "(Type " ^ (Int.toString l) ^ ")"
+        | _ => raise unimplemented "Parser.pp primop"
       )
     | ATOM a => a
     | FUNCALL (fname, l) =>
@@ -440,6 +467,23 @@ end = struct
         | _ => error (id, "first argument of ALIAS must be an identifier")
       end
 
+  and parseType (ls: Reader.t vector): (t, string) result =
+    if Vector.length ls <> 2
+    then error (Vector.sub (ls, 0), "Type expects exactly one argument")
+    else let
+        val lvl = Vector.sub (ls, 1)
+        fun err () = error (lvl, "Type expects a non-negative int argument")
+      in case Reader.item lvl of
+          Reader.ATOM a => (
+            case Int.fromString a of
+              SOME x => if x < 0 then err () else Ok {
+                source = Reader.source (Vector.sub (ls, 0)),
+                item = PRIMOP (TYPE x) }
+            | NONE => err ()
+          )
+        | _ => err ()
+      end
+
   and parse (r: Reader.t): (t, string) result =
     case Reader.item r of
       Reader.FOREST ss =>
@@ -474,6 +518,7 @@ end = struct
               Ok { source = Reader.source r, item = FUNCALL (fst, rst) }))
           | Reader.ATOM "claim" => parseClaim ls
           | Reader.ATOM "alias" => parseAlias ls
+          | Reader.ATOM "Type" => parseType ls
           | Reader.ATOM a => p ls >>= (fn rst =>
               let val fst = { source = Reader.source fst, item = ATOM a }
               in Ok { source = Reader.source r, item = FUNCALL (fst, rst) }
@@ -526,6 +571,7 @@ end = struct
             "internal error: unexpected CLAIM during type normalisation")
         | Parser.ALIAS _ => error (p,
             "internal error: unexpected ALIAS during type normalisation")
+        | Parser.TYPE x => Ok (Type.LEVEL x)
         | _ => raise unimplemented "norm primop"
       )
     | Parser.ATOM a => (
@@ -548,7 +594,7 @@ end = struct
       fun wrap (t: IdTable.t, id: string, orig: Parser.t) (ty: Type.t) =
         case IdTable.insertOrGet (t, id, { orig = orig, norm = ty }) of
           IdTable.INSERT t => Ok t
-        | IdTable.GET p => Err "bad wrap, implement this"
+        | IdTable.GET p => raise unimplemented "type check wrap get"
           (* TODO: print source information for debugging *)
       fun helper (it: Parser.t, tbl: IdTable.t): (IdTable.t, string) result =
         case Parser.item it of
