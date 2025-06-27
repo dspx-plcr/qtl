@@ -14,6 +14,7 @@ structure Type :> sig
     FUN of (t vector) * t
   | SUM of t vector
   | PROD of t vector
+  | PRIM of t vector
     (* TODO: uint? *)
   | LEVEL of int
 
@@ -25,6 +26,7 @@ end = struct
     FUN of (t vector) * t
   | SUM of t vector
   | PROD of t vector
+  | PRIM of t vector
   | LEVEL of int
 
   fun pp (t: t): string =
@@ -35,9 +37,11 @@ end = struct
       in "(sum" ^ (Vector.foldl f "" ss) ^ ")"
       end
     | PROD ps => raise unimplemented "Type.pp prod"
+    | PRIM ps => raise unimplemented "Type.pp prim"
     | LEVEL l => "(Type " ^ (Int.toString l) ^ ")"
 
   fun result (FUN (_, r)) = r
+    | result (PRIM ps) = raise unimplemented "Type.result PRIM"
     | result r = r
 
   fun eq (l: t, r: t): bool =
@@ -57,6 +61,10 @@ end = struct
           andalso vcheck (la, ra)
     | (SUM ls, SUM rs) => vcheck (ls, rs)
     | (PROD lp, PROD rp) => vcheck (lp, rp)
+      (* TODO: Just comparing on the holes isn't sufficient *)
+    | (PRIM lp, PRIM rp) => raise unimplemented "Type.eq prim"
+    | (PRIM lp, FUN (ra, rr)) => raise unimplemented "Type.eq prim/fun"
+    | (FUN (la, lr), PRIM rp) => raise unimplemented "Type.eq fun/prim"
     | (LEVEL l, LEVEL r) => l = r
     | _ => false
     end
@@ -110,17 +118,32 @@ functor HashMap(
   type t = { buf: (word * key * value) list array, len: int ref, cap: int ref }
   datatype ins_or_get = INSERT of t | GET of value
 
-  fun get_idx (buf: t, k: key): int =
-    Word.toInt (Word.mod (H.hash k, Word.fromInt (!(#cap buf))))
+  fun calc_idx (k: key, sz: int): int =
+    Word.toInt (Word.mod (H.hash k, Word.fromInt sz))
+  fun get_idx (buf: t, k: key): int = calc_idx (k, !(#cap buf))
 
   fun empty () = { buf = Array.array (7, []), len = ref 0, cap = ref 7 }
+  fun app (f: (word * key * value) -> unit) (tbl: t): unit =
+    Array.app (fn ls => List.app f ls) (#buf tbl)
   fun fold (f: (word * key * value) * 'a -> 'a) (acc: 'a) (tbl: t): 'a =
     Array.foldl (fn (ls, acc) => List.foldl f acc ls) acc (#buf tbl)
 
-  fun grow ({ buf, len = ref len, cap = ref cap }: t): t =
-    raise unimplemented "bleh"
+  fun grow (tbl as { buf, len = ref len, cap = ref cap }: t): t =
+    let
+      val suggested_size = floor ((Real.fromInt cap) * 1.5)
+      val newsz = if suggested_size > cap + 2 then suggested_size else cap * 2
+      val newbuf = Array.array (newsz, [])
+      fun f (tup as (word, key, value)): unit =
+        let
+          val idx = calc_idx (key, newsz)
+          val bucket = Array.sub (newbuf, idx)
+        in Array.update (newbuf, idx, tup :: bucket)
+        end
+      val () = app f tbl
+    in { buf = newbuf, len = ref len, cap = ref newsz }
+    end
 
-  fun tryGet
+  fun try_get
     (tbl as { buf, len = ref len, cap = ref cap }: t, k: key): value option
   = let
       val h = H.hash k
@@ -145,7 +168,7 @@ functor HashMap(
     end
 
   fun insertOrGet (tbl: t, k: key, v: value): ins_or_get =
-    case tryGet (tbl, k) of
+    case try_get (tbl, k) of
       SOME v' => GET v'
     | NONE => INSERT (insert (tbl, k, v))
 end
@@ -322,7 +345,7 @@ end = struct
       ((c >= #"A") andalso (c <= #"Z")) orelse
       ((c >= #"a") andalso (c <= #"z")) orelse
       ((c >= #"0") andalso (c <= #"9")) orelse
-      oneOf "!@#$%^&*_+,./<>?;:~"
+      oneOf "-=!@#$%^&*_+,./<>?;:~"
     end
 
   fun isWhitespace (c: char): bool =
@@ -428,7 +451,7 @@ structure Parser :> sig
     CLAIM of string * t
   | ALIAS of string * t
   | LAMBDA
-  | FUNCTION
+  | FUNCTION of t vector * t
   | BIND
   | SUM of t vector
   | PROD
@@ -452,7 +475,7 @@ end = struct
     CLAIM of string * t
   | ALIAS of string * t
   | LAMBDA
-  | FUNCTION
+  | FUNCTION of t vector * t
   | BIND
   | SUM of t vector
   | PROD
@@ -469,6 +492,10 @@ end = struct
           CLAIM (s, t) => "(claim " ^ s ^ " " ^ (pp t) ^ ")"
         | ALIAS (s, t) => "(alias " ^ s ^ " " ^ (pp t) ^ ")"
         | TYPE l => "(Type " ^ (Int.toString l) ^ ")"
+        | FUNCTION (args, res) =>
+          let fun f (e, acc) = acc ^ " " ^ (pp e)
+          in "(->" ^ (Vector.foldl f "" args) ^ " " ^ (pp res) ^ ")"
+          end
         | SUM ss =>
           let fun f (e, acc) = acc ^ " " ^ (pp e)
           in "(sum" ^ (Vector.foldl f "" ss) ^ ")"
@@ -565,6 +592,19 @@ end = struct
   and parsePrim (ls: Reader.t vector): (item, string) result =
     parse_vector ls >>= (fn ls => Ok (PRIMOP (PRIM ls)))
 
+  and parseFunc (ls: Reader.t vector): (item, string) result =
+    if Vector.length ls < 3
+    then error (Vector.sub (ls, 0), "-> expects at least two arguments")
+    else let
+        val numargs = Vector.length ls - 2
+        val result = Vector.sub (ls, numargs)
+        val args = VectorSlice.vector (
+          VectorSlice.slice (ls, 0, SOME (numargs+1)))
+      in parse result >>= (fn result =>
+        parse_vector args >>= (fn args =>
+        Ok (PRIMOP (FUNCTION (args, result)))))
+      end
+
   and parse (r: Reader.t): (t, string) result =
     (* TODO: some work is needed here to ensure CLAIM, etc are only top-level *)
     case Reader.item r of
@@ -598,6 +638,7 @@ end = struct
           | Reader.ATOM "Type" => parseType ls
           | Reader.ATOM "sum" => parseSum ls >>= add_source r
           | Reader.ATOM "prim" => parsePrim ls >>= add_source r
+          | Reader.ATOM "->" => parseFunc ls >>= add_source r
           | Reader.ATOM a => parse_vector rst >>= (fn rst =>
               let val fst = { source = Reader.source fst, item = ATOM a }
               in Ok { source = Reader.source r, item = FUNCALL (fst, rst) }
@@ -608,6 +649,7 @@ end = struct
     | Reader.ATOM "alias" => error (r, "ALIAS must be used as a function")
     | Reader.ATOM "sum" => error (r, "SUM must be used as a function")
     | Reader.ATOM "prim" => error (r, "PRIM must be used as a function")
+    | Reader.ATOM "->" => error (r, "-> must be used as a function")
     | Reader.ATOM a => Ok { source = Reader.source r, item = ATOM a }
 end
 
@@ -681,11 +723,22 @@ end = struct
           in Vector.foldli f (Ok []) ss >>= (fn ss =>
             Ok (Type.SUM (Vector.fromList (fst :: (List.rev ss)))))
           end)
+        | Parser.FUNCTION (args, result) =>
+          let
+            val result = normalise (state, result)
+            fun f (_, Err e) = Err e
+              | f (l, Ok ls) = normalise (state, l) >>= (fn l => Ok (l :: ls))
+            val argsls = Vector.foldl f (Ok []) args
+            fun mkvec ls = Vector.fromList (List.rev ls)
+          in result >>= (fn result =>
+            argsls >>= (fn args =>
+            Ok (Type.FUN (mkvec args, result))))
+          end
         | _ => raise unimplemented "norm primop"
       )
     | Parser.ATOM a => (
-        case ValueTable.tryGet (#values state, a) of
-          SOME { orig, def } => Ok (Value.typeof def)
+        case TypeTable.try_get (#types state, a) of
+          SOME { orig, norm } => Ok norm
         | NONE => error (p, "encountered identifier without declared type")
       )
     | Parser.FUNCALL (fst, rst) => normalise (state, fst) >>= (
@@ -698,6 +751,10 @@ end = struct
             "expected FUNCTION type but found\n" ^ (Type.pp ty))
       )
 
+  (*
+   * TODO: Is this right for identifiers? It should say Nat.zero is of type
+   * Nat not of type (Type 0)
+   *)
   fun reduce (state: tables, p: Parser.t): (tables * Value.t, string) result =
     case Parser.item p of
       Parser.FOREST _ =>
@@ -709,25 +766,20 @@ end = struct
         | Parser.ALIAS _ =>
             error (p, "internal error: unexpected ALIAS during reduction")
         | Parser.TYPE x => Ok (state, Value.TYPE (Type.LEVEL x))
-        | Parser.PRIM x =>
+        | Parser.PRIM ts =>
           let
-            val res = Value.PRIM (#next_prim state)
-          in raise unimplemented "reduce PRIM"
+            val num = #next_prim state
+            fun f (_, Err e) = Err e
+              | f (t, Ok ts) = normalise (state, t) >>= (fn t => Ok (t::ts))
+            fun prims' tys = {
+              next_prim = num + 1,
+              values = #values state,
+              types = #types state,
+              prims = PrimitiveTable.insert (#prims state, num, {
+                orig = p, prim = Type.PRIM tys }) }
+          in Vector.foldl f (Ok []) ts >>= (fn tys =>
+            Ok (prims' (Vector.fromList (List.rev tys)), Value.PRIM num))
           end
-
-(* TODO: Remove
-          let
-            val res = Value.PRIM (#next_prim state)
-            val v = { orig = p, def = res }
-          in case ValueTable.insertOrGet (#values state, x, v) of
-            ValueTable.INSERT tab => Ok ({
-              types = #types state, values = tab,
-              next_prim = #next_prim state + 1 }, res)
-          | ValueTable.GET prev => error (p, "redefinition of " ^ x ^
-              ". Previously declared as `" ^ (Value.pp (#def prev)) ^ "` at " ^
-              (err_pos (#orig prev)))
-          end
-*)
         | Parser.SUM ss =>
           if Vector.length ss = 0
           then error (p, "sum type cannot be empty; expected value")
@@ -759,7 +811,7 @@ end = struct
         | Parser.ALIAS _ =>
             error (p, "internal error: unexpected ALIAS during typing")
         | Parser.TYPE x => Ok (Type.LEVEL (x + 1))
-        | Parser.PRIM _ => Ok (Type.LEVEL 0)
+        | Parser.PRIM ps => raise unimplemented "Typer.get_type PRIMOP PRIM"
         | Parser.SUM ss =>
           let
             fun f (_, Err e) = Err e
@@ -770,7 +822,12 @@ end = struct
           end
         | _ => raise unimplemented "Typer.get_type primop"
       )
-    | _ => raise unimplemented "Typer.get_type top-level"
+    | Parser.FUNCALL (fname, ls) => raise unimplemented "Typer.get_type FUNCALL"
+    | Parser.ATOM a => (
+      case TypeTable.try_get (#types state, a) of
+          NONE => error (p, "usage of identifier with unknown type: " ^ a)
+        | SOME { norm, orig } => Ok norm
+      )
 
   fun check (p: Parser.t): (t, string) result =
     let
@@ -807,7 +864,7 @@ end = struct
                  * TODO: We need to walk this tree and for every PRIM, add an
                  * entry in to the types table.
                  *)
-                case TypeTable.tryGet (#types state, id) of
+                case TypeTable.try_get (#types state, id) of
                   NONE => raise unimplemented "check alias"
                 | SOME tyl => get_type (state, x) >>= (fn tyr =>
                   if Type.eq (#norm tyl, tyr)
