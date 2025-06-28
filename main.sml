@@ -1,5 +1,6 @@
 fun prn (str: string): unit = TextIO.output (TextIO.stdOut, str ^ "\n")
 exception unimplemented of string
+val max = Int.max
 
 structure Result = struct
   datatype ('a, 'b) result = Ok of 'a | Err of 'b
@@ -14,34 +15,39 @@ structure Type :> sig
     FUN of (t vector) * t
   | SUM of t vector
   | PROD of t vector
-  | PRIM of t vector
+  | PRIM of t * (t vector)
     (* TODO: uint? *)
   | LEVEL of int
 
   val pp: t -> string
   val result: t -> t
   val eq: t * t -> bool
+  val level: t -> int
 end = struct
   datatype t =
     FUN of (t vector) * t
   | SUM of t vector
   | PROD of t vector
-  | PRIM of t vector
+  | PRIM of t * (t vector)
   | LEVEL of int
 
-  fun pp (t: t): string =
+
+  fun pp_vec (v: t vector): string =
+    let fun f (0, e, _) = pp e
+          | f (_, e, acc) = acc ^ " " ^ (pp e)
+    in (Vector.foldli f "" v)
+    end
+
+  and pp (t: t): string =
     case t of
-      FUN (args, ret) => raise unimplemented "Type.pp fun"
-    | SUM ss =>
-      let fun f (s, acc) = acc ^ " " ^ (pp s)
-      in "(sum" ^ (Vector.foldl f "" ss) ^ ")"
-      end
+      FUN (args, ret) => "(-> " ^ (pp_vec args) ^ " " ^ (pp ret) ^ ")"
+    | SUM ss => "(sum " ^ (pp_vec ss) ^ ")"
     | PROD ps => raise unimplemented "Type.pp prod"
-    | PRIM ps => raise unimplemented "Type.pp prim"
+    | PRIM (p, ps) => raise unimplemented "Type.pp prim"
     | LEVEL l => "(Type " ^ (Int.toString l) ^ ")"
 
   fun result (FUN (_, r)) = r
-    | result (PRIM ps) = raise unimplemented "Type.result PRIM"
+    | result (PRIM (ty, _)) = ty
     | result r = r
 
   fun eq (l: t, r: t): bool =
@@ -68,6 +74,13 @@ end = struct
     | (LEVEL l, LEVEL r) => l = r
     | _ => false
     end
+
+  fun vec_lvl (vs: t vector) = Vector.foldl (fn (t, m) => max (level t, m)) 0 vs
+  and level (FUN (ts, t)) = max (level t, vec_lvl ts)
+    | level (SUM ts) = vec_lvl ts
+    | level (PROD ts) = vec_lvl ts
+    | level (PRIM (t, ts)) = max (level t, vec_lvl ts)
+    | level (LEVEL i) = i
 end
 
 structure Value :> sig
@@ -319,6 +332,7 @@ structure Reader :> sig
   val source: t -> Source.slice
   val item: t -> item
   val read: Source.t -> (t, string) result
+  val splice: t -> t
   val pp: t -> string
 end = struct
   (* TODO: figure out how to only have one definition *)
@@ -354,6 +368,16 @@ end = struct
     | #"\n" => true
     | #"\t" => true
     | _ => false
+
+  (* TODO: should splicing an atom be allowed? return a result? *)
+  fun splice { source, item = LIST ls } =
+      { source = source, item = FOREST ls }
+    | splice { source, item = FOREST ls } =
+      { source = source, item = FOREST ls }
+    | splice { source, item = ATOM s } =
+      let val it = Vector.fromList [{ source = source, item = ATOM s }]
+      in { source = source, item = FOREST it }
+      end
 
   fun pp (e: t): string =
     case #item e of
@@ -457,7 +481,7 @@ structure Parser :> sig
   | PROD
   | MATCH
   | EQUAL
-  | PRIM of t vector
+  | SCHEMA of { params: t vector, indices: t vector, prims: t vector }
   | TYPE of int
 
   val pp: t -> string
@@ -481,11 +505,19 @@ end = struct
   | PROD
   | MATCH
   | EQUAL
-  | PRIM of t vector
+  | SCHEMA of { params: t vector, indices: t vector, prims: t vector }
   | TYPE of int
   withtype t = { source: Source.slice, item: item }
 
-  fun pp (p: t): string =
+  fun pp_forest (v: t vector): string =
+    let fun f (0, e, _) = pp e
+          | f (_, e, acc) = acc ^ " " ^ (pp e)
+    in (Vector.foldli f "" v)
+    end
+
+  and pp_list (v: t vector): string = "(" ^ (pp_forest v) ^ ")"
+
+  and pp (p: t): string =
     case #item p of
       PRIMOP p' => (
         case p' of
@@ -493,25 +525,16 @@ end = struct
         | ALIAS (s, t) => "(alias " ^ s ^ " " ^ (pp t) ^ ")"
         | TYPE l => "(Type " ^ (Int.toString l) ^ ")"
         | FUNCTION (args, res) =>
-          let fun f (e, acc) = acc ^ " " ^ (pp e)
-          in "(->" ^ (Vector.foldl f "" args) ^ " " ^ (pp res) ^ ")"
-          end
-        | SUM ss =>
-          let fun f (e, acc) = acc ^ " " ^ (pp e)
-          in "(sum" ^ (Vector.foldl f "" ss) ^ ")"
-          end
-        | PRIM tys =>
-          let fun f (e, acc) = acc ^ " " ^ (pp e)
-          in "(prim" ^ (Vector.foldl f "" tys) ^ ")"
-          end
+          "(-> " ^ (pp_forest args) ^ " " ^ (pp res) ^ ")"
+        | SUM ss => "(sum " ^ (pp_forest ss) ^ ")"
+        | SCHEMA { params, indices, prims } =>
+          "(schema " ^ (pp_list params) ^ " " ^ (pp_list indices) ^ " " ^
+            (pp_forest prims) ^ ")"
         | _ => raise unimplemented "Parser.pp primop"
       )
     | ATOM a => a
     | FUNCALL (fname, l) =>
-      let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else " ") ^ (pp e))
-      in "(" ^ (pp fname) ^ " " ^
-        ((fn (_, x) => x) (Vector.foldl f (true, "") l)) ^ ")"
-      end
+      "(" ^ (pp fname) ^ (if Vector.length l = 0 then "" else pp_forest l) ^ ")"
     | FOREST l =>
       let fun f (e, (fst, a)) = (false, a ^ (if fst then "" else "\n") ^ (pp e))
       in (fn (_, x) => x) (Vector.foldl f (true, "") l)
@@ -589,8 +612,29 @@ end = struct
     then error (Vector.sub (ls, 0), "sum expects at least one argument")
     else parse_vector ls >>= (fn ls => Ok (PRIMOP (SUM ls)))
 
-  and parsePrim (ls: Reader.t vector): (item, string) result =
-    parse_vector ls >>= (fn ls => Ok (PRIMOP (PRIM ls)))
+  and parseSchema (ls: Reader.t vector): (item, string) result =
+    if Vector.length ls < 4
+    then error (Vector.sub (ls, 0), "SCHEMA expects at least 3 arguments")
+    else let
+        val params = Vector.sub (ls, 1)
+        val indices = Vector.sub (ls, 2)
+        val prims = VectorSlice.vector (VectorSlice.slice (ls, 2, NONE))
+      in
+        (case parse (Reader.splice params) of
+            Ok { source, item = FOREST ls } => Ok ls
+          | Err e => Err e
+          | _ => error (params,
+              "internal error: parsing a forest should return a forest")
+        ) >>= (fn pa =>
+        (case parse (Reader.splice indices) of
+            Ok { source, item = FOREST ls } => Ok ls
+          | Err e => Err e
+          | _ => error (indices,
+              "internal error: parsing a forest should return a forest")
+        ) >>= (fn i =>
+        parse_vector prims >>= (fn pr =>
+        Ok (PRIMOP (SCHEMA { params = pa, indices = i, prims = pr })))))
+      end
 
   and parseFunc (ls: Reader.t vector): (item, string) result =
     if Vector.length ls < 3
@@ -620,7 +664,7 @@ end = struct
         end
     | Reader.LIST ls =>
       if Vector.length ls = 0
-      then error (r, "empty function call. Did you mean the empty list, Nil?")
+      then error (r, "empty function call")
       else (
         let
           val fst = Vector.sub (ls, 0)
@@ -637,7 +681,7 @@ end = struct
           | Reader.ATOM "alias" => parseAlias ls >>= add_source r
           | Reader.ATOM "Type" => parseType ls
           | Reader.ATOM "sum" => parseSum ls >>= add_source r
-          | Reader.ATOM "prim" => parsePrim ls >>= add_source r
+          | Reader.ATOM "schema" => parseSchema ls >>= add_source r
           | Reader.ATOM "->" => parseFunc ls >>= add_source r
           | Reader.ATOM a => parse_vector rst >>= (fn rst =>
               let val fst = { source = Reader.source fst, item = ATOM a }
@@ -649,6 +693,7 @@ end = struct
     | Reader.ATOM "alias" => error (r, "ALIAS must be used as a function")
     | Reader.ATOM "sum" => error (r, "SUM must be used as a function")
     | Reader.ATOM "prim" => error (r, "PRIM must be used as a function")
+    | Reader.ATOM "schema" => error (r, "SCHEMA must be used as a function")
     | Reader.ATOM "->" => error (r, "-> must be used as a function")
     | Reader.ATOM a => Ok { source = Reader.source r, item = ATOM a }
 end
@@ -711,6 +756,8 @@ end = struct
         | Parser.ALIAS _ => error (p,
             "internal error: unexpected ALIAS during type normalisation")
         | Parser.TYPE x => Ok (Type.LEVEL x)
+        | Parser.SCHEMA _ => error (p,
+            "internal error: unexpected SCHEMA during type normalisation")
         | Parser.SUM ss => normalise (state, (Vector.sub (ss, 0))) >>=
           (fn fst => let
             fun f (0, _, Ok acc) = Ok acc
@@ -720,16 +767,16 @@ end = struct
                 then Ok (s' :: acc)
                 else error (s, "expecting a type compatible with `"
                   ^ (Type.pp fst) ^ "`, but found type `" ^ (Type.pp s') ^ "`"))
-          in Vector.foldli f (Ok []) ss >>= (fn ss =>
-            Ok (Type.SUM (Vector.fromList (fst :: (List.rev ss)))))
+          in Vector.foldri f (Ok []) ss >>= (fn ss =>
+            Ok (Type.SUM (Vector.fromList (fst :: ss))))
           end)
         | Parser.FUNCTION (args, result) =>
           let
             val result = normalise (state, result)
             fun f (_, Err e) = Err e
               | f (l, Ok ls) = normalise (state, l) >>= (fn l => Ok (l :: ls))
-            val argsls = Vector.foldl f (Ok []) args
-            fun mkvec ls = Vector.fromList (List.rev ls)
+            val argsls = Vector.foldr f (Ok []) args
+            fun mkvec ls = Vector.fromList ls
           in result >>= (fn result =>
             argsls >>= (fn args =>
             Ok (Type.FUN (mkvec args, result))))
@@ -766,6 +813,9 @@ end = struct
         | Parser.ALIAS _ =>
             error (p, "internal error: unexpected ALIAS during reduction")
         | Parser.TYPE x => Ok (state, Value.TYPE (Type.LEVEL x))
+        | Parser.SCHEMA { params, indices, prims } =>
+          raise unimplemented "Typer.reduce SCHEMA"
+(*
         | Parser.PRIM ts =>
           let
             val num = #next_prim state
@@ -780,6 +830,7 @@ end = struct
           in Vector.foldl f (Ok []) ts >>= (fn tys =>
             Ok (prims' (Vector.fromList (List.rev tys)), Value.PRIM num))
           end
+*)
         | Parser.SUM ss =>
           if Vector.length ss = 0
           then error (p, "sum type cannot be empty; expected value")
@@ -792,9 +843,9 @@ end = struct
                 then Ok (s' :: acc)
                 else error (s, "expecting a type compatible with `"
                   ^ (Type.pp fst) ^ "`, but found type `" ^ (Type.pp s') ^ "`"))
-          in Vector.foldli f (Ok []) ss >>= (fn ss =>
+          in Vector.foldri f (Ok []) ss >>= (fn ss =>
             Ok (state, Value.TYPE (Type.SUM (
-              Vector.fromList (fst :: (List.rev ss))))))
+              Vector.fromList (fst :: ss)))))
           end)
         | _ => raise unimplemented "Typer.reduce primop"
       )
@@ -811,7 +862,24 @@ end = struct
         | Parser.ALIAS _ =>
             error (p, "internal error: unexpected ALIAS during typing")
         | Parser.TYPE x => Ok (Type.LEVEL (x + 1))
-        | Parser.PRIM ps => raise unimplemented "Typer.get_type PRIMOP PRIM"
+        | Parser.SCHEMA { params, indices, prims } =>
+          let
+            fun tt (_, Err e) = Err e
+              | tt (v, Ok vs) = normalise (state, v) >>= (fn v => Ok (v :: vs))
+            fun to_types vs = Vector.foldr tt (Ok []) vs >>= (fn ls =>
+              Ok (Vector.fromList ls))
+          in
+            to_types params >>= (fn params =>
+            to_types indices >>= (fn indices =>
+            let
+              val merged = Vector.concat [params, indices]
+              fun f (ty, lvl) = max (Type.level ty, lvl)
+            in Ok (
+              if Vector.length merged = 0
+              then Type.LEVEL 0
+              else Type.FUN (merged, Type.LEVEL (Vector.foldl f 0 merged)))
+            end))
+          end
         | Parser.SUM ss =>
           let
             fun f (_, Err e) = Err e
