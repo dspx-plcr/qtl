@@ -19,9 +19,6 @@ data Error = Error {
   msg :: String
 }
 
-makeError :: Slice -> String -> Result a
-makeError sl st = Left (Error sl { end = sl.begin } st :| [])
-
 errorHere :: Slice -> String -> Result a
 errorHere sl st = Left (Error sl { end = sl.begin } st :| [])
 

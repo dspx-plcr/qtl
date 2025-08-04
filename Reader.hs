@@ -1,4 +1,5 @@
 module Reader (
+  Item(..),
   Term(..),
   pp,
   read,
@@ -12,6 +13,7 @@ import Data.Function
 import Data.List (intercalate, reverse)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.STRef
+import Data.Text (Text, pack, unpack)
 
 import Error
 import Source
@@ -27,9 +29,11 @@ instance Show State where
       show st.stack ++ ", nextTok = " ++ show st.nextTok ++ "}"
 
 data Term =
-    Forest Slice (Array Int Term)
-  | List Slice (Array Int Term)
-  | Atom Slice String
+    Forest (Array Word Item)
+  | List (Array Word Item)
+  | Atom Text
+
+data Item = Item { source :: Slice, term :: Term }
 
 newState :: String -> State
 newState prog = State {
@@ -38,20 +42,22 @@ newState prog = State {
   nextTok = 0
 }
 
-advance :: State -> State
-advance st = st { buf = Source.advance st.buf }
+advance :: STRef s State -> ST s ()
+advance st = modifySTRef st $ \st -> st { buf = Source.advance st.buf }
 
 isWhitespace c = c `elem` " \t\n\r"
 isAtomChar c = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
   (c >= '0' && c <= '9') || (c `elem` "-=!@#$%^&*_+,./<>?;:~")
-params ls = listArray (1, length ls) (reverse ls)
+params :: [Item] -> Array Word Item
+params ls = listArray (1, fromIntegral $ length ls) (reverse ls)
 
-pp :: Term -> String
-pp (Atom _ str) = str
-pp (List _ arr) = "(" ++ (intercalate " " (map pp (elems arr))) ++ ")"
-pp (Forest _ fst) = intercalate "\n" . map pp . elems $ fst
+pp :: Item -> String
+pp Item { term = (Atom str) } = unpack str
+pp Item { term = (List arr) } =
+  "(" ++ (intercalate " " (map pp (elems arr))) ++ ")"
+pp Item { term = (Forest fst) } = intercalate "\n" . map pp . elems $ fst
 
-readForest :: STRef s State -> ST s (Result Term)
+readForest :: STRef s State -> ST s (Result Item)
 readForest str = do
   st <- readSTRef str
   res <- helper []
@@ -59,42 +65,42 @@ readForest str = do
   return $ case res of
     Left err -> Left err
     Right res ->
-      let buf = st.buf in Right . Forest (buf { end = st'.buf.end }) $ res
+      let buf = st.buf
+      in Right $ Item { source = buf { end = st'.buf.end }, term = Forest res }
   where
-    helper :: [Term] -> ST s (Result (Array Int Term))
+    helper :: [Item] -> ST s (Result (Array Word Item))
     helper res = do
       st <- readSTRef str
       case peek st.buf of
         Nothing -> return . Right . params $ res
         Just '(' -> readList str >>= \case
           Left err -> return $ Left err
-          Right term -> helper (term:res)
-        Just c | isWhitespace c -> modifySTRef str advance >> helper res
+          Right item -> helper (item:res)
+        Just c | isWhitespace c -> advance str >> helper res
         Just c | isAtomChar c -> readAtom str >>= \case
-        	Left err -> return $ Left err
-        	Right term -> helper (term:res)
+          Left err -> return $ Left err
+          Right item -> helper (item:res)
+        Just c -> return . errorHere st.buf $
+          "unrecognised character `" ++ [c] ++ "`"
       
-readList :: STRef s State -> ST s (Result Term)
+readList :: STRef s State -> ST s (Result Item)
 readList str = do
   st <- readSTRef str
-  modifySTRef str advance
+  advance str
   res <- helper []
   st' <- readSTRef str
   return $ case res of
     Left err -> mergeErrors (errorHere st.buf "error parsing list") (Left err)
     Right res ->
-      let buf = st.buf in Right . List (buf { end = st'.buf.end }) $ res
+      let buf = st.buf
+      in Right $ Item { source = buf { end = st'.buf.end }, term = List res }
   where
-    helper :: [Term] -> ST s (Result (Array Int Term))
+    helper :: [Item] -> ST s (Result (Array Word Item))
     helper res = do
       st <- readSTRef str
       case peek st.buf of
         Nothing -> return $ errorHere st.buf "unexpected EOF when parsing list"
-        Just ')' -> do
-          modifySTRef str advance
-          st' <- readSTRef str
-          let end = st'.buf.begin
-          return . Right $ params res
+        Just ')' -> advance str >> (return . Right $ params res)
         Just c -> do
           x <- _read str
           st' <- readSTRef str
@@ -102,9 +108,9 @@ readList str = do
             Nothing -> return $
               errorHere st'.buf "unexpected EOF when parsing list"
             Just (Left err) -> return $ Left err
-            Just (Right term) -> helper (term:res)
+            Just (Right item) -> helper (item:res)
 
-readAtom :: STRef s State -> ST s (Result Term)
+readAtom :: STRef s State -> ST s (Result Item)
 readAtom str = do
   st <- readSTRef str
   res <- helper ""
@@ -112,25 +118,26 @@ readAtom str = do
   return $ case res of
     Left err -> Left err
     Right res ->
-      let buf = st.buf in Right . Atom (buf { end = st'.buf.end }) $ res
+      let buf = st.buf
+      in Right $ Item { source = buf { end = st'.buf.end }, term = Atom res }
   where
-    helper :: String -> ST s (Result String)
+    helper :: String -> ST s (Result Text)
     helper at = do
       st <- readSTRef str
       case peek st.buf of
-        Just c | isAtomChar c -> modifySTRef str advance >> helper (c:at)
+        Just c | isAtomChar c -> advance str >> helper (c:at)
         _ | null at -> return $ errorHere st.buf "expected atom character"
-        _ -> return . Right $ reverse at
+        _ -> return . Right . pack . reverse $ at
 
-_read :: STRef s State -> ST s (Maybe (Result Term))
+_read :: STRef s State -> ST s (Maybe (Result Item))
 _read str = do
   st <- readSTRef str
   case peek st.buf of
     Nothing -> return Nothing
     Just '(' -> readList str >>= return . Just
-    Just c | isWhitespace c -> modifySTRef str advance >> _read str
+    Just c | isWhitespace c -> advance str >> _read str
     Just c | isAtomChar c -> readAtom str >>= return . Just
     _ -> return . Just $ errorHere st.buf "unexpected character"
 
-read :: String -> Result Term
+read :: String -> Result Item
 read = newState >>> \st -> runST $ newSTRef st >>= readForest
