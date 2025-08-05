@@ -20,6 +20,7 @@ import Source
 
 data State = State {
   buf :: Slice,
+  last :: Mark,
   stack :: [(Int, Mark, String)],
   nextTok :: Int
 }
@@ -45,6 +46,9 @@ newState prog = State {
 advance :: STRef s State -> ST s ()
 advance st = modifySTRef st $ \st -> st { buf = Source.advance st.buf }
 
+stop :: STRef s State -> ST s ()
+stop st = modifySTRef st $ \st -> st { last = st.buf.begin }
+
 isWhitespace c = c `elem` " \t\n\r"
 isAtomChar c = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
   (c >= '0' && c <= '9') || (c `elem` "-=!@#$%^&*_+,./<>?;:~")
@@ -66,7 +70,8 @@ readForest str = do
     Left err -> Left err
     Right res ->
       let buf = st.buf
-      in Right $ Item { source = buf { end = st'.buf.end }, term = Forest res }
+      in Right $ Item { source = buf { end = st'.last }, term = Forest res
+      }
   where
     helper :: [Item] -> ST s (Result (Array Word Item))
     helper res = do
@@ -93,14 +98,14 @@ readList str = do
     Left err -> mergeErrors (errorHere st.buf "error parsing list") (Left err)
     Right res ->
       let buf = st.buf
-      in Right $ Item { source = buf { end = st'.buf.end }, term = List res }
+      in Right $ Item { source = buf { end = st'.last }, term = List res }
   where
     helper :: [Item] -> ST s (Result (Array Word Item))
     helper res = do
       st <- readSTRef str
       case peek st.buf of
         Nothing -> return $ errorHere st.buf "unexpected EOF when parsing list"
-        Just ')' -> advance str >> (return . Right $ params res)
+        Just ')' -> stop str >> advance str >> (return . Right $ params res)
         Just c -> do
           x <- _read str
           st' <- readSTRef str
@@ -119,13 +124,13 @@ readAtom str = do
     Left err -> Left err
     Right res ->
       let buf = st.buf
-      in Right $ Item { source = buf { end = st'.buf.end }, term = Atom res }
+      in Right $ Item { source = buf { end = st'.last }, term = Atom res }
   where
     helper :: String -> ST s (Result Text)
     helper at = do
       st <- readSTRef str
       case peek st.buf of
-        Just c | isAtomChar c -> advance str >> helper (c:at)
+        Just c | isAtomChar c -> stop str >> advance str >> helper (c:at)
         _ | null at -> return $ errorHere st.buf "expected atom character"
         _ -> return . Right . pack . reverse $ at
 

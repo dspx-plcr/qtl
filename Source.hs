@@ -11,7 +11,6 @@ module Source (
 ) where
 
 import Data.Maybe
-import Numeric.Natural
 
 data Mark = Mark {
   pos :: Int,
@@ -23,7 +22,7 @@ instance Show (Mark) where
   show Mark { line, col } = show line ++ ":" ++ show col
 
 nextLine :: Mark -> Mark
-nextLine m = Mark (m.pos + 1) (m.line + 1) 0
+nextLine m = Mark (m.pos + 1) (m.line + 1) 1
 
 nextCol :: Mark -> Mark
 nextCol m = Mark (m.pos + 1) m.line (m.col + 1)
@@ -51,13 +50,13 @@ peek sl@Slice { begin, end } =
 advance :: Slice -> Slice
 advance s = sub s 1 Nothing
 
-skip :: Slice -> Natural -> Slice
+skip :: Slice -> Word -> Slice
 skip s n =
   let (d, t) = splitAt (fromEnum n) s.buf
       f acc val = (if val == '\n' then nextLine else nextCol) acc
   in s { buf = t, begin = foldl f s.begin d }
 
-sub :: Slice -> Natural -> Maybe Natural -> Slice
+sub :: Slice -> Word -> Maybe Word -> Slice
 sub s n Nothing = skip s n
 sub s n (Just m) = let s' = skip s n in s' {
 	buf = take (fromEnum m) s'.buf,
