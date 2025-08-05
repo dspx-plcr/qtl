@@ -8,6 +8,7 @@ module Parser (
 import Data.Array (Array, array, assocs, bounds, elems, listArray, (!))
 import Data.Function ((&))
 import Data.Ix (rangeSize)
+import Data.List (intercalate)
 import Data.Maybe (maybe)
 import Data.Text (Text, unpack)
 import Text.Read (readMaybe)
@@ -48,7 +49,24 @@ data SchemaPrims = SchemaPrims {
 }
 
 pp :: Item -> String
-pp Item { term = _ } = "<<unimplemented pp>>"
+pp Item { term } = case term of
+  Forest fs -> intercalate "\n" . map pp . elems $ fs
+  Funcall fun params -> "(" ++ (pp fun) ++ (sp params) ++ (ppV params) ++ ")"
+  PrimOp p -> case p of
+    Claim id def -> "(claim " ++ (unpack id) ++ " " ++ (pp def) ++ ")"
+    Alias id def -> "(alias " ++ (unpack id) ++ " " ++ (pp def) ++ ")"
+    Function params ret -> "(-> " ++ (ppV params) ++ " " ++ (pp ret) ++ ")"
+    Schema { params, indices, prims } -> "(schema (" ++
+    	(ppBinds " " params.items) ++ ") (" ++ (ppV indices.items) ++ ")\n\t" ++
+    	(ppBinds "\n\t" prims.items) ++ ")"
+    Type level -> "(Type " ++ (show level) ++ ")"
+  Atom atom -> unpack atom
+  where
+    ppV = intercalate " " . map pp . elems
+    sp xs = if rangeSize (bounds xs) == 0 then "" else " "
+    ppBinds int binds =
+      let f (n, d) = "(" ++ (unpack n) ++ " " ++ (pp d) ++ ")"
+      in intercalate int . map f $ elems binds
 
 from :: Reader.Item -> Term -> Result Item
 from item term = Right $ Item { source = item.source, term = term }
