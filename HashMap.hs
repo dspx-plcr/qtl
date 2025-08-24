@@ -24,7 +24,7 @@ data GetOrPut k v = Get v | Put (HashMap k v)
 
 empty :: HashMap k v
 empty = HashMap {
-  buckets = array (0, 6) [(i, []) | i <- [0..]],
+  buckets = array (0, 6) [(i, []) | i <- [0..6]],
   len = 0,
   cap = 7
 }
@@ -48,11 +48,11 @@ get (HashMap { buckets, len, cap }) key =
   in find (\(k,_) -> k == key) b >>= return . snd
 
 putAssumeCap :: (Hashable k, Eq k) => HashMap k v -> k -> v -> HashMap k v
-putAssumeCap map key value =
+putAssumeCap HashMap { buckets, cap, len } key value =
   let h = fromInteger . toInteger . abs $ hash key
-      idx = mod h map.cap
-      b = (:) (key, value) . filter ((/=) key . fst) $ map.buckets ! idx
-  in HashMap { buckets = map.buckets // [(idx, b)], len = map.len, cap = map.cap }
+      idx = mod h cap
+      b = (:) (key, value) . filter ((/=) key . fst) $ buckets ! idx
+  in HashMap { buckets = buckets // [(idx, b)], len, cap }
 
 put :: (Hashable k, Eq k) => HashMap k v -> k -> v -> HashMap k v
 put map =

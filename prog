@@ -13,7 +13,7 @@
 (claim Maybe (-> (Type 0) (Type 0)))
 (alias Maybe (schema ((A (Type 0))) ()
 	(Maybe.nothing (Maybe A))
-	(Maybe.just (-> A Maybe A))))
+	(Maybe.just (-> A (Maybe A)))))
 
 (claim Vect (-> (Type 0) Nat (Type 0)))
 (alias Vect (schema ((A (Type 0))) (Nat)
