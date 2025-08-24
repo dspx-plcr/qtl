@@ -1,6 +1,7 @@
 module Parser (
   Item(..),
   Term(..),
+  PrimOp(..),
   parse,
   pp
 ) where
